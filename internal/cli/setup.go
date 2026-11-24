@@ -11,6 +11,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/killedoxygen/berth/internal/api"
@@ -269,12 +270,17 @@ func (s *setupCtx) service(skip bool) func() error {
 		}
 		switch {
 		case s.host.OS == "darwin":
-			return s.launchd()
+			err := s.launchd()
+			if err == nil {
+				return nil
+			}
+			// No GUI login session (ssh, CI): launchd refuses the agent. Run it directly instead.
+			fmt.Println("  launchd unavailable here:", err)
 		case s.host.Systemd && (s.system || s.host.SystemdUser):
 			return s.systemd()
 		}
-		// No service manager we know: start it now, detached, and say how to make it permanent.
-		s.did("start `%s daemon` in the background (no systemd/launchd found)", s.rec.Binary)
+		// No service manager we can use: start it now, detached, and say how to make it permanent.
+		s.did("start `%s daemon` in the background (no usable systemd/launchd)", s.rec.Binary)
 		if s.dry {
 			return nil
 		}
@@ -290,6 +296,7 @@ func (s *setupCtx) service(skip bool) func() error {
 		if err := cmd.Start(); err != nil {
 			return err
 		}
+		s.rec.Service = fmt.Sprintf("pid:%d:%d", cmd.Process.Pid, probe.ProcStart(cmd.Process.Pid))
 		fmt.Printf("  add `%s daemon >>%s 2>&1 &` to your login startup to keep it across reboots\n", s.rec.Binary, logPath)
 		return nil
 	}
@@ -524,6 +531,16 @@ func cmdUninstall(args []string) int {
 	}
 	_ = json.Unmarshal(data, &rec)
 	switch {
+	case strings.HasPrefix(rec.Service, "pid:"):
+		var pid int
+		var start uint64
+		if _, err := fmt.Sscanf(rec.Service, "pid:%d:%d", &pid, &start); err == nil && start != 0 && probe.ProcStart(pid) == start {
+			_ = syscall.Kill(pid, syscall.SIGTERM)
+			for i := 0; i < 50 && probe.ProcStart(pid) == start; i++ {
+				time.Sleep(100 * time.Millisecond)
+			}
+			fmt.Println("  stopped the daemon (pid", pid, ")")
+		}
 	case rec.Service == launchdLabel:
 		_ = exec.Command("launchctl", "bootout", "gui/"+strconv.Itoa(os.Getuid())+"/"+launchdLabel).Run()
 	case rec.Service != "":

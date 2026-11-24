@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/killedoxygen/berth/internal/cli"
 	"github.com/killedoxygen/berth/internal/config"
@@ -21,7 +22,7 @@ var version = "dev"
 func main() {
 	cli.Version = version
 	name := filepath.Base(os.Args[0])
-	if name != "berth" && name != "berth.test" {
+	if !strings.HasPrefix(name, "berth") { // any berth* name is berth itself (berth-v2, berth.new ...)
 		os.Exit(runShim(name))
 	}
 	if len(os.Args) == 3 && os.Args[1] == "__supervise" {
