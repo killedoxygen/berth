@@ -375,7 +375,7 @@ func TestBuildParallelismFollowsReservation(t *testing.T) {
 
 func TestLogsAreCompressedAndBounded(t *testing.T) {
 	// About 50 MiB of output into a 256K-per-job budget.
-	id := submit(t, "--", "sh", "-c", `seq 1 2000000 | sed 's/$/ of a chatty build/'`)
+	id := submit(t, "--", "sh", "-c", `awk 'BEGIN { for (i = 1; i <= 2000000; i++) printf "%d of a chatty build\n", i }'`)
 	if r := berth(t, "", "wait", "--quiet", id); r.code != 0 {
 		t.Fatalf("wait: %+v", r.stderr)
 	}
