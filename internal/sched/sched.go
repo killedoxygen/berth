@@ -31,6 +31,9 @@ type Input struct {
 	Lookup func(string) *job.Job // any job by id, for dependencies
 	Peaks  map[string]int64      // service id -> peak working bytes over the peak window
 	Hold   *job.Reason           // when set, nothing starts (pause, pressure, emergency)
+	// Shared (system-mode) daemon: interleave users and cap each one's share.
+	Fair      bool
+	UserShare float64 // fraction of pool memory one non-root user may hold; 0: no cap
 }
 
 type Wait struct {
@@ -77,17 +80,23 @@ func ChargeOf(cfg *config.Config, j *job.Job, working, peak int64, now time.Time
 }
 
 type pool struct {
-	cfg     *config.Config
-	h       probe.Health
-	charges []Charge
-	working []int64
-	groups  map[string]*job.Job
-	now     time.Time
+	cfg       *config.Config
+	h         probe.Health
+	charges   []Charge
+	working   []int64
+	groups    map[string]*job.Job
+	now       time.Time
+	byUser    map[int]int64 // memory charged per uid
+	userShare float64
 }
 
 func (p *pool) add(j *job.Job, c Charge, working int64) {
 	p.charges = append(p.charges, c)
 	p.working = append(p.working, working)
+	if p.byUser == nil {
+		p.byUser = map[int]int64{}
+	}
+	p.byUser[j.UID] += c.Memory
 	if j.Spec.Group != "" {
 		p.groups[j.Spec.Group] = j
 	}
@@ -116,6 +125,12 @@ func (p *pool) fit(j *job.Job) (reasons []job.Reason, maxMem int64) {
 	cfg, h := p.cfg, p.h
 	add := func(code, format string, args ...any) {
 		reasons = append(reasons, job.Reason{Code: code, Text: fmt.Sprintf(format, args...)})
+	}
+	if p.userShare > 0 && j.UID != 0 {
+		limit := int64(float64(int64(cfg.Pool.Memory)-int64(cfg.Pool.Overhead)) * p.userShare)
+		if held := p.byUser[j.UID]; held+j.Spec.Memory > limit {
+			add(job.RUserShare, "your active jobs hold %s of your %s share of the pool (users.max_share)", fmtB(held), fmtB(limit))
+		}
 	}
 	if holder, ok := p.groups[j.Spec.Group]; ok && j.Spec.Group != "" {
 		add(job.RGroup, "group %q is held by job %s (%s)", j.Spec.Group, job.Short(holder.ID), holder.Label())
@@ -209,11 +224,25 @@ func short(cfg *config.Config, j *job.Job) bool {
 	return j.Spec.Timeout > 0 && j.Spec.Timeout <= time.Duration(cfg.Scheduler.ShortJob)
 }
 
-// Order sorts queued jobs: priority, then age.
-func Order(q []*job.Job) {
+// Order sorts queued jobs: priority, then age. With fair, users are
+// interleaved: each user's first waiting job before anyone's second.
+func Order(q []*job.Job, fair bool) {
+	rank := map[*job.Job]int{}
+	if fair {
+		byAge := append([]*job.Job(nil), q...)
+		sort.SliceStable(byAge, func(a, b int) bool { return byAge[a].Created.Before(byAge[b].Created) })
+		seen := map[int]int{}
+		for _, j := range byAge {
+			rank[j] = seen[j.UID]
+			seen[j.UID]++
+		}
+	}
 	sort.SliceStable(q, func(a, b int) bool {
 		if q[a].Spec.Priority != q[b].Spec.Priority {
 			return q[a].Spec.Priority > q[b].Spec.Priority
+		}
+		if rank[q[a]] != rank[q[b]] {
+			return rank[q[a]] < rank[q[b]]
 		}
 		return q[a].Created.Before(q[b].Created)
 	})
@@ -221,7 +250,7 @@ func Order(q []*job.Job) {
 
 func Schedule(in Input) Plan {
 	plan := Plan{Waiting: map[string]Wait{}}
-	p := &pool{cfg: in.Cfg, h: in.Health, groups: map[string]*job.Job{}, now: in.Now}
+	p := &pool{cfg: in.Cfg, h: in.Health, groups: map[string]*job.Job{}, now: in.Now, userShare: in.UserShare}
 	var services []Charge
 	for _, j := range in.Active {
 		w := in.Health.JobWorking[j.ID]
@@ -232,7 +261,7 @@ func Schedule(in Input) Plan {
 		}
 	}
 	queue := append([]*job.Job(nil), in.Queued...)
-	Order(queue)
+	Order(queue, in.Fair)
 
 	var protected *job.Job
 	position := 0

@@ -15,7 +15,7 @@ func readAll(t *testing.T, dir, id string) string {
 	var b strings.Builder
 	offset := int64(0)
 	for i := 0; i < 1000; i++ {
-		data, next, err := Read(dir, id, offset, 64<<10)
+		data, next, err := Plain(dir).Read(id, offset, 64<<10)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -55,7 +55,7 @@ func TestRoundTripCompressedSegments(t *testing.T) {
 			t.Fatalf("finished logs must be fully compressed, found %s", f)
 		}
 	}
-	stream, disk := Size(dir, "j")
+	stream, disk := Plain(dir).Size("j")
 	if stream != int64(want.Len()) || disk*5 > stream {
 		t.Fatalf("stream %d, disk %d: repetitive output should compress at least 5x", stream, disk)
 	}
@@ -68,7 +68,7 @@ func TestKeepsHeadAndTailWithinBudget(t *testing.T) {
 		fmt.Fprint(w, line(i))
 	}
 	w.Close()
-	if _, disk := Size(dir, "j"); disk > 3000+4096 {
+	if _, disk := Plain(dir).Size("j"); disk > 3000+4096 {
 		t.Fatalf("disk %d exceeds the budget", disk)
 	}
 	got := readAll(t, dir, "j")
@@ -84,7 +84,7 @@ func TestTailRead(t *testing.T) {
 		fmt.Fprint(w, line(i))
 	}
 	w.Close()
-	data, _, err := Read(dir, "j", -int64(len(line(0))*2), 1<<20)
+	data, _, err := Plain(dir).Read("j", -int64(len(line(0))*2), 1<<20)
 	if err != nil || data != line(498)+line(499) {
 		t.Fatalf("tail: %q %v", data, err)
 	}
@@ -109,7 +109,7 @@ func TestRotatingFile(t *testing.T) {
 func TestSealLegacyAndOrphanedLogs(t *testing.T) {
 	dir := t.TempDir()
 	os.WriteFile(filepath.Join(dir, "old.log"), []byte(line(1)+line(2)), 0o600)
-	if err := Seal(dir, "old"); err != nil {
+	if err := Plain(dir).Seal("old"); err != nil {
 		t.Fatal(err)
 	}
 	if got := readAll(t, dir, "old"); got != line(1)+line(2) {
@@ -126,5 +126,47 @@ func TestReadsLegacyLiveLog(t *testing.T) {
 	os.WriteFile(filepath.Join(dir, "old.log"), []byte(line(7)), 0o600)
 	if got := readAll(t, dir, "old"); got != line(7) {
 		t.Fatalf("a job still writing a 0.1 log must stay readable: %q", got)
+	}
+}
+
+// A root daemon reads logs in directories their users control. Nothing a user
+// plants there may make it read or write other files.
+func TestPlantedSymlinksAreNeverFollowed(t *testing.T) {
+	dir, outside := t.TempDir(), t.TempDir()
+	secret := filepath.Join(outside, "secret")
+	os.WriteFile(secret, []byte("TOP SECRET\n"), 0o600)
+	os.Symlink(secret, filepath.Join(dir, "j.0.log"))
+	os.Symlink(secret, filepath.Join(dir, "j.11-22.log.gz"))
+	d := Dir{Path: dir, Owner: os.Getuid()}
+	if data, _, _ := d.Read("j", 0, 1<<20); strings.Contains(data, "SECRET") {
+		t.Fatal("read through a symlink")
+	}
+	if err := d.Seal("j"); err != nil {
+		t.Fatal(err)
+	}
+	if data, _ := os.ReadFile(secret); string(data) != "TOP SECRET\n" {
+		t.Fatal("the symlink target was modified")
+	}
+	// A planted destination name must not redirect the compressed write.
+	victim := filepath.Join(outside, "victim")
+	os.WriteFile(victim, []byte("keep\n"), 0o600)
+	os.WriteFile(filepath.Join(dir, "k.0.log"), []byte("hello"), 0o600)
+	os.Symlink(victim, filepath.Join(dir, "k.0-5.log.gz"))
+	if err := d.Seal("k"); err != nil {
+		t.Fatal(err)
+	}
+	if data, _ := os.ReadFile(victim); string(data) != "keep\n" {
+		t.Fatal("seal wrote through a planted symlink")
+	}
+	if data, _, _ := d.Read("k", 0, 100); data != "hello" {
+		t.Fatalf("sealed log: %q", data)
+	}
+}
+
+func TestForeignOwnedFilesAreIgnored(t *testing.T) {
+	dir := t.TempDir()
+	os.WriteFile(filepath.Join(dir, "j.0.log"), []byte("mine"), 0o600)
+	if data, _, _ := (Dir{Path: dir, Owner: os.Getuid() + 1}).Read("j", 0, 100); data != "" {
+		t.Fatal("a file owned by someone else must not be served as this user's log")
 	}
 }

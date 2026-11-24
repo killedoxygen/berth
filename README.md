@@ -187,10 +187,13 @@ while jobs run.
 
 ## Security model
 
-A user daemon accepts only its own user (peer credentials on the socket). A
-system daemon accepts everyone, runs each job as its submitter, lets users
-act only on their own jobs, and hides other users' command lines. Job
-environments are stored with mode 0600 and never returned by the API.
+A user daemon accepts only its own user. A system daemon accepts every local
+user and isolates them: each job runs as its submitter in their own SELinux
+login context; users see and act on only their own jobs (others appear as state
+and size); locks are per user; per-user limits on jobs, connections and pool
+share keep one user from crowding out the rest; and the root daemon never
+follows anything a user plants in their log directory. Details and reporting:
+[SECURITY.md](SECURITY.md).
 
 ## Development
 

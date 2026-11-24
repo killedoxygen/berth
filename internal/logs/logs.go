@@ -17,6 +17,7 @@ import (
 	"bufio"
 	"bytes"
 	"compress/gzip"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -25,6 +26,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 
 	"github.com/killedoxygen/berth/internal/units"
 )
@@ -160,81 +162,131 @@ func (w *Writer) Close() error {
 	return err
 }
 
-func compress(src, dst string) (int64, error) {
-	in, err := os.Open(src)
+func compress(src, dst string) (int64, error) { return compressAs(src, dst, -1) }
+
+// compressAs gzips src into dst. With owner >= 0 (a root daemon working in a
+// user's directory) src must be that user's regular file, and dst is created
+// exclusively under a random name and handed to the user, so nothing the user
+// planted (symlinks, pre-created names) can redirect root's reads or writes.
+func compressAs(src, dst string, owner int) (int64, error) {
+	in, err := openOwned(src, owner)
 	if err != nil {
 		return 0, err
 	}
 	defer in.Close()
-	tmp := dst + ".tmp"
-	out, err := os.OpenFile(tmp, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
+	out, err := os.CreateTemp(filepath.Dir(dst), ".seal-*")
 	if err != nil {
+		return 0, err
+	}
+	tmp := out.Name()
+	fail := func(err error) (int64, error) {
+		out.Close()
+		os.Remove(tmp)
 		return 0, err
 	}
 	zw, _ := gzip.NewWriterLevel(out, gzip.BestSpeed)
 	if _, err := io.Copy(zw, bufio.NewReaderSize(in, 256<<10)); err != nil {
-		out.Close()
-		os.Remove(tmp)
-		return 0, err
+		return fail(err)
 	}
 	if err := zw.Close(); err != nil {
-		out.Close()
-		os.Remove(tmp)
-		return 0, err
+		return fail(err)
+	}
+	if owner >= 0 && os.Geteuid() == 0 {
+		if err := out.Chown(owner, -1); err != nil {
+			return fail(err)
+		}
 	}
 	info, err := out.Stat()
-	if err == nil {
-		err = out.Close()
-	} else {
-		out.Close()
-	}
 	if err != nil {
+		return fail(err)
+	}
+	if err := out.Close(); err != nil {
 		os.Remove(tmp)
 		return 0, err
 	}
 	return info.Size(), os.Rename(tmp, dst)
 }
 
+// openOwned opens a file for reading without following symlinks and, with
+// owner >= 0, only if it is a regular file owned by owner.
+func openOwned(path string, owner int) (*os.File, error) {
+	fd, err := syscall.Open(path, syscall.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK|syscall.O_CLOEXEC, 0)
+	if err != nil {
+		return nil, &os.PathError{Op: "open", Path: path, Err: err}
+	}
+	f := os.NewFile(uintptr(fd), path)
+	info, err := f.Stat()
+	if err != nil {
+		f.Close()
+		return nil, err
+	}
+	if !info.Mode().IsRegular() {
+		f.Close()
+		return nil, fmt.Errorf("%s: not a regular file", path)
+	}
+	if owner >= 0 {
+		if st, ok := info.Sys().(*syscall.Stat_t); !ok || int(st.Uid) != owner {
+			f.Close()
+			return nil, fmt.Errorf("%s: not owned by uid %d", path, owner)
+		}
+	}
+	return f, nil
+}
+
 // ---------------------------------------------------------------- reading
 
-// segments lists a job's segments in stream order.
-func segments(dir, id string) []segment {
-	matches, _ := filepath.Glob(filepath.Join(dir, id+".*.log*"))
-	if _, err := os.Stat(filepath.Join(dir, id+".log")); err == nil {
-		matches = append(matches, filepath.Join(dir, id+".log"))
+// Dir is a log directory. Owner >= 0 means a root daemon is reading a user's
+// directory: only regular files owned by that user are considered.
+type Dir struct {
+	Path  string
+	Owner int
+}
+
+// Plain is a directory the caller owns.
+func Plain(path string) Dir { return Dir{Path: path, Owner: -1} }
+
+func (d Dir) acceptable(info os.FileInfo) bool {
+	if !info.Mode().IsRegular() {
+		return false // symlinks and anything else are never followed
 	}
+	if d.Owner >= 0 {
+		st, ok := info.Sys().(*syscall.Stat_t)
+		return ok && int(st.Uid) == d.Owner
+	}
+	return true
+}
+
+// segments lists a job's segments in stream order.
+func (d Dir) segments(id string) []segment {
+	matches, _ := filepath.Glob(filepath.Join(d.Path, id+".*.log*"))
+	matches = append(matches, filepath.Join(d.Path, id+".log"))
 	var out []segment
 	for _, p := range matches {
+		info, err := os.Lstat(p)
+		if err != nil || !d.acceptable(info) {
+			continue
+		}
 		name := strings.TrimPrefix(filepath.Base(p), id+".")
-		var s segment
-		s.path = p
+		s := segment{path: p, size: info.Size()}
 		switch {
 		case name == "log": // written by berth 0.1 (a job still running from before an upgrade)
-			info, err := os.Stat(p)
-			if err != nil {
-				continue
-			}
 			s.start, s.end, s.live = 0, info.Size(), true
 		case strings.HasSuffix(name, ".log.gz"):
 			a, b, ok := strings.Cut(strings.TrimSuffix(name, ".log.gz"), "-")
 			start, err1 := strconv.ParseInt(a, 10, 64)
 			end, err2 := strconv.ParseInt(b, 10, 64)
-			if !ok || err1 != nil || err2 != nil {
+			if !ok || err1 != nil || err2 != nil || end < start {
 				continue
 			}
 			s.start, s.end = start, end
 		case strings.HasSuffix(name, ".log"):
 			start, err := strconv.ParseInt(strings.TrimSuffix(name, ".log"), 10, 64)
-			info, serr := os.Stat(p)
-			if err != nil || serr != nil {
+			if err != nil || start < 0 {
 				continue
 			}
 			s.start, s.end, s.live = start, start+info.Size(), true
 		default:
 			continue
-		}
-		if info, err := os.Stat(p); err == nil {
-			s.size = info.Size()
 		}
 		out = append(out, s)
 	}
@@ -243,8 +295,8 @@ func segments(dir, id string) []segment {
 }
 
 // Size returns a job's logical output length and bytes on disk.
-func Size(dir, id string) (stream, disk int64) {
-	for _, s := range segments(dir, id) {
+func (d Dir) Size(id string) (stream, disk int64) {
+	for _, s := range d.segments(id) {
 		stream = max(stream, s.end)
 		disk += s.size
 	}
@@ -254,8 +306,8 @@ func Size(dir, id string) (stream, disk int64) {
 // Read returns up to limit bytes of the stream from offset (negative: that many
 // bytes before the end) and the offset to continue from. Dropped ranges read as
 // a one-line marker.
-func Read(dir, id string, offset int64, limit int) (string, int64, error) {
-	segs := segments(dir, id)
+func (d Dir) Read(id string, offset int64, limit int) (string, int64, error) {
+	segs := d.segments(id)
 	if len(segs) == 0 {
 		return "", 0, nil
 	}
@@ -275,7 +327,7 @@ func Read(dir, id string, offset int64, limit int) (string, int64, error) {
 			fmt.Fprintf(&out, "\n[berth: %s of output dropped here to keep this log within its size limit]\n", units.FormatBytes(s.start-offset))
 			offset = s.start
 		}
-		data, err := readSegment(s, offset-s.start, limit-out.Len())
+		data, err := d.readSegment(s, offset-s.start, limit-out.Len())
 		if err != nil {
 			return out.String(), offset, err
 		}
@@ -288,10 +340,10 @@ func Read(dir, id string, offset int64, limit int) (string, int64, error) {
 	return out.String(), offset, nil
 }
 
-func readSegment(s segment, skip int64, limit int) ([]byte, error) {
-	f, err := os.Open(s.path)
+func (d Dir) readSegment(s segment, skip int64, limit int) ([]byte, error) {
+	f, err := openOwned(s.path, d.Owner)
 	if err != nil {
-		if os.IsNotExist(err) {
+		if errors.Is(err, os.ErrNotExist) {
 			return nil, nil // compressed or dropped between listing and reading
 		}
 		return nil, err
@@ -321,8 +373,8 @@ func readSegment(s segment, skip int64, limit int) ([]byte, error) {
 }
 
 // Remove deletes all of a job's log files.
-func Remove(dir, id string) {
-	matches, _ := filepath.Glob(filepath.Join(dir, id+".*"))
+func (d Dir) Remove(id string) {
+	matches, _ := filepath.Glob(filepath.Join(d.Path, id+".*"))
 	for _, p := range matches {
 		_ = os.Remove(p)
 	}
@@ -341,26 +393,20 @@ func DirSize(dir string) int64 {
 }
 
 // JobSize sums the files of one job.
-func JobSize(dir, id string) int64 {
-	_, disk := Size(dir, id)
+func (d Dir) JobSize(id string) int64 {
+	_, disk := d.Size(id)
 	return disk
 }
 
 // Seal compresses whatever a job left uncompressed: a live segment from a
 // supervisor that died, or a plain <id>.log from before segmented logs.
-func Seal(dir, id string) error {
-	legacy := filepath.Join(dir, id+".log")
-	if _, err := os.Stat(legacy); err == nil {
-		if err := os.Rename(legacy, filepath.Join(dir, id+".0.log")); err != nil {
-			return err
-		}
-	}
-	for _, s := range segments(dir, id) {
+func (d Dir) Seal(id string) error {
+	for _, s := range d.segments(id) {
 		if !s.live {
 			continue
 		}
 		if s.end > s.start {
-			if _, err := compress(s.path, filepath.Join(dir, fmt.Sprintf("%s.%d-%d.log.gz", id, s.start, s.end))); err != nil {
+			if _, err := compressAs(s.path, filepath.Join(d.Path, fmt.Sprintf("%s.%d-%d.log.gz", id, s.start, s.end)), d.Owner); err != nil {
 				return err
 			}
 		}

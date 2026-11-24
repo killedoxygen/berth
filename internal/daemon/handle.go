@@ -11,7 +11,6 @@ import (
 
 	"github.com/killedoxygen/berth/internal/api"
 	"github.com/killedoxygen/berth/internal/job"
-	"github.com/killedoxygen/berth/internal/logs"
 	"github.com/killedoxygen/berth/internal/peer"
 	"github.com/killedoxygen/berth/internal/probe"
 	"github.com/killedoxygen/berth/internal/units"
@@ -37,6 +36,11 @@ func (d *Daemon) handle(raw *net.UnixConn) {
 		_ = c.Send(fail(api.EDenied, "this daemon belongs to uid %d", d.uid))
 		return
 	}
+	if !d.connect(uid) {
+		_ = c.Send(fail(api.EDenied, "too many open connections for uid %d (users.max_connections)", uid))
+		return
+	}
+	defer d.disconnect(uid)
 	_ = c.SetDeadline(time.Now().Add(30 * time.Second))
 	var req api.Request
 	if err := c.Recv(&req); err != nil {
@@ -54,7 +58,7 @@ func (d *Daemon) handle(raw *net.UnixConn) {
 	case "attach":
 		d.attach(c, cl, req, fds)
 	case "claim":
-		d.claim(c, req)
+		d.claim(c, cl, req)
 	default:
 		for _, fd := range fds {
 			syscall.Close(fd)
@@ -68,13 +72,13 @@ func (d *Daemon) handle(raw *net.UnixConn) {
 }
 
 // lookup resolves a job reference and checks the caller may act on it.
-func (d *Daemon) lookup(cl client, ref string, write bool) (*job.Job, *api.Response) {
-	j, err := d.st.Resolve(ref)
+// lookup resolves a job reference among the jobs the caller owns (any job, for
+// root or a per-user daemon). Other users' jobs are reachable only through the
+// redacted status listing.
+func (d *Daemon) lookup(cl client, ref string, _ bool) (*job.Job, *api.Response) {
+	j, err := d.resolve(ref, cl.uid)
 	if err != nil {
 		return nil, fail(api.ENotFound, "%v", err)
-	}
-	if write && d.opt.Paths.System && cl.uid != 0 && j.UID != cl.uid {
-		return nil, fail(api.EDenied, "job %s belongs to another user", job.Short(j.ID))
 	}
 	return j, nil
 }
@@ -118,7 +122,7 @@ func (d *Daemon) simple(cl client, req api.Request) *api.Response {
 		if resp != nil {
 			return resp
 		}
-		p := j.Public()
+		p := d.view(cl.uid, j)
 		return &api.Response{Job: &p}
 	case "cancel":
 		j, resp := d.lookup(cl, req.ID, true)
@@ -163,7 +167,7 @@ func (d *Daemon) simple(cl client, req api.Request) *api.Response {
 		if d.opt.Paths.System && cl.uid != 0 && j.UID != cl.uid {
 			return fail(api.EDenied, "job %s belongs to another user", job.Short(j.ID))
 		}
-		return d.logs(j, req.Offset, req.Limit)
+		return d.readLogs(j, req.Offset, req.Limit)
 	}
 	return fail(api.EInvalid, "unknown operation %q", req.Op)
 }
@@ -197,7 +201,7 @@ func (d *Daemon) update(j *job.Job, u *api.Update) *api.Response {
 		}
 	}
 	spec.After, spec.AfterAny = nil, nil
-	if err := d.normalize(&spec); err != nil {
+	if err := d.normalize(&spec, j.UID); err != nil {
 		return fail(api.EInvalid, "%v", err)
 	}
 	spec.After, spec.AfterAny = j.Spec.After, j.Spec.AfterAny
@@ -211,7 +215,7 @@ func (d *Daemon) update(j *job.Job, u *api.Update) *api.Response {
 
 const maxLogChunk = 256 << 10
 
-func (d *Daemon) logs(j *job.Job, offset int64, limit int) *api.Response {
+func (d *Daemon) readLogs(j *job.Job, offset int64, limit int) *api.Response {
 	if j.Spec.Passthrough {
 		return &api.Response{Warning: "this job's output went to its submitter's terminal, not to a log"}
 	}
@@ -221,7 +225,7 @@ func (d *Daemon) logs(j *job.Job, offset int64, limit int) *api.Response {
 	if limit <= 0 || limit > maxLogChunk {
 		limit = maxLogChunk
 	}
-	data, next, err := logs.Read(d.logDir(j), j.ID, offset, limit)
+	data, next, err := d.logs(j).Read(j.ID, offset, limit)
 	if err != nil {
 		return fail(api.EInternal, "reading the log: %v", err)
 	}
@@ -264,11 +268,25 @@ func (d *Daemon) submit(c *api.Conn, cl client, req api.Request, fds []int) {
 			}
 		}
 	}
-	if err := d.normalize(&spec); err != nil {
+	if err := d.normalize(&spec, cl.uid); err != nil {
 		d.mu.Unlock()
 		closeFDs()
 		_ = c.Send(fail(api.EInvalid, "%v", err))
 		return
+	}
+	if d.opt.Paths.System && cl.uid != 0 {
+		unfinished := 0
+		for _, other := range d.st.All() {
+			if other.UID == cl.uid && !other.State.Terminal() {
+				unfinished++
+			}
+		}
+		if unfinished >= d.cfg.Users.MaxJobs {
+			d.mu.Unlock()
+			closeFDs()
+			_ = c.Send(fail(api.EDenied, "you already have %d unfinished jobs (users.max_jobs); wait for some or cancel them", unfinished))
+			return
+		}
 	}
 	j := &job.Job{ID: job.NewID(), UID: cl.uid, Spec: spec, State: job.Queued, Created: time.Now(), Token: job.NewToken()}
 	if req.Bind {
@@ -325,10 +343,10 @@ func (d *Daemon) attach(c *api.Conn, cl client, req api.Request, fds []int) {
 }
 
 // claim hands a passthrough job's descriptors to its supervisor.
-func (d *Daemon) claim(c *api.Conn, req api.Request) {
+func (d *Daemon) claim(c *api.Conn, cl client, req api.Request) {
 	d.mu.Lock()
 	j := d.st.Get(req.ID)
-	if j == nil || req.Token == "" || req.Token != j.Token {
+	if j == nil || req.Token == "" || req.Token != j.Token || (d.opt.Paths.System && cl.uid != 0 && cl.uid != j.UID) {
 		d.mu.Unlock()
 		_ = c.Send(fail(api.EDenied, "invalid claim"))
 		return
@@ -412,4 +430,21 @@ func (d *Daemon) watch(c *api.Conn, id string) {
 			return
 		}
 	}
+}
+
+// connect counts a caller's open connections; false when over the per-user limit.
+func (d *Daemon) connect(uid int) bool {
+	d.connMu.Lock()
+	defer d.connMu.Unlock()
+	if uid != 0 && d.opt.Paths.System && d.conns[uid] >= d.cfg.Users.MaxConnections {
+		return false
+	}
+	d.conns[uid]++
+	return true
+}
+
+func (d *Daemon) disconnect(uid int) {
+	d.connMu.Lock()
+	defer d.connMu.Unlock()
+	d.conns[uid]--
 }

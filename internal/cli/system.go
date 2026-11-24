@@ -68,12 +68,6 @@ func cmdDaemon(args []string) int {
 	if err != nil {
 		return fail(err)
 	}
-	if *system && cfg.Backend.SELinuxContext == "" && host.SELinux == "enforcing" {
-		if _, err := os.Stat("/etc/selinux/targeted"); err == nil {
-			// Jobs get the context of a normal login, not the service manager's (which may not use docker, etc).
-			cfg.Backend.SELinuxContext = "unconfined_u:unconfined_r:unconfined_t:s0-s0:c0.c1023"
-		}
-	}
 	if *system && cfg.Backend.Kind == "process" {
 		return fail(fmt.Errorf("a system daemon needs the systemd backend"))
 	}

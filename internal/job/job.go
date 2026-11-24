@@ -4,6 +4,7 @@ package job
 import (
 	"crypto/rand"
 	"encoding/hex"
+	"strings"
 	"time"
 )
 
@@ -56,6 +57,7 @@ const (
 	RUnsatisfied  = "unsatisfiable"
 	REmergency    = "emergency"
 	RAttach       = "attach"
+	RUserShare    = "user_share" // this user's active jobs already hold their share (system mode)
 )
 
 // Capacity reports whether a reason code is about pool capacity held by other jobs.
@@ -165,6 +167,12 @@ func (j *Job) Label() string {
 		}
 		out += a
 	}
+	out = strings.Map(func(r rune) rune {
+		if r < 0x20 || r == 0x7f {
+			return ' ' // no control characters in logs, unit descriptions or terminals
+		}
+		return r
+	}, out)
 	if len(out) > 72 {
 		out = out[:71] + "…"
 	}

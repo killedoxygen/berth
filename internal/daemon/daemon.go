@@ -59,7 +59,9 @@ type Daemon struct {
 	held     map[string][]int // passthrough descriptors awaiting their supervisor
 	watchers map[string]map[chan struct{}]struct{}
 	gone     map[string]time.Time // owner first seen gone
-	lastHold map[string]string    // last logged reason codes per job
+	connMu   sync.Mutex
+	conns    map[int]int       // open connections per uid
+	lastHold map[string]string // last logged reason codes per job
 
 	started         time.Time
 	pressurePaused  bool
@@ -102,7 +104,7 @@ func New(opt Options) (*Daemon, error) {
 		log:  log.New(opt.Log, "", 0),
 		wake: make(chan struct{}, 1), quit: make(chan struct{}),
 		peaks: map[string][]sample{}, held: map[string][]int{}, watchers: map[string]map[chan struct{}]struct{}{},
-		gone: map[string]time.Time{}, lastHold: map[string]string{}, started: time.Now(),
+		gone: map[string]time.Time{}, lastHold: map[string]string{}, started: time.Now(), conns: map[int]int{},
 	}
 	return d, nil
 }
@@ -187,6 +189,12 @@ func (d *Daemon) listen() (*net.UnixListener, error) {
 	if err := os.MkdirAll(filepath.Dir(sock), 0o755); err != nil {
 		return nil, err
 	}
+	if d.opt.Paths.System {
+		// Explicit: the service's umask must not lock users out of the socket directory.
+		if err := os.Chmod(filepath.Dir(sock), 0o755); err != nil {
+			return nil, err
+		}
+	}
 	if c, err := net.Dial("unix", sock); err == nil {
 		c.Close()
 		return nil, fmt.Errorf("a daemon is already listening on %s", sock)
@@ -224,7 +232,7 @@ func (d *Daemon) recover() {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	for _, j := range d.st.Finished() {
-		if err := logs.Seal(d.logDir(j), j.ID); err != nil {
+		if err := d.logs(j).Seal(j.ID); err != nil {
 			d.log.Printf("sealing the log of %s: %v", job.Short(j.ID), err)
 		}
 	}
@@ -318,7 +326,8 @@ func (d *Daemon) input(now time.Time) sched.Input {
 		}
 	}
 	return sched.Input{Cfg: d.cfg, Health: d.health, Now: now, Active: d.st.InStates(job.Starting, job.Running, job.Stopping),
-		Queued: queued, Lookup: d.st.Get, Peaks: peaks, Hold: d.holdReason}
+		Queued: queued, Lookup: d.st.Get, Peaks: peaks, Hold: d.holdReason,
+		Fair: d.opt.Paths.System, UserShare: map[bool]float64{true: d.cfg.Users.MaxShare}[d.opt.Paths.System]}
 }
 
 func (d *Daemon) launch(j *job.Job) {
@@ -721,8 +730,11 @@ func (d *Daemon) maybeMaintain() {
 var groupRE = regexp.MustCompile(`^[A-Za-z0-9_.:@/-]{1,128}$`)
 
 // normalize fills defaults and rejects requests that can never run, with the fix in the message.
-func (d *Daemon) normalize(s *job.Spec) error {
+// normalize fills defaults and rejects requests that can never run, or that
+// uid may not make, with the fix in the message.
+func (d *Daemon) normalize(s *job.Spec, uid int) error {
 	cfg := d.cfg
+	shared := d.opt.Paths.System && uid != 0
 	if len(s.Argv) == 0 {
 		return errors.New("no command given")
 	}
@@ -774,14 +786,53 @@ func (d *Daemon) normalize(s *job.Spec) error {
 	}
 	for _, list := range [][]string{s.After, s.AfterAny} {
 		for i, ref := range list {
-			dep, err := d.st.Resolve(ref)
+			dep, err := d.resolve(ref, uid)
 			if err != nil {
 				return fmt.Errorf("dependency: %v", err)
 			}
 			list[i] = dep.ID
 		}
 	}
+	if shared {
+		if s.Kind == job.Service && !cfg.Users.AllowServices {
+			return errors.New("services (--service) are reserved for root on this shared daemon (users.allow_services); submit it as a batch job")
+		}
+		// Groups are per user, so one user cannot hold another's lock. A
+		// "global:" prefix opts into a group shared by everyone (a device, say).
+		if s.Group != "" && !strings.HasPrefix(s.Group, "global:") && !strings.HasPrefix(s.Group, fmt.Sprintf("u%d:", uid)) {
+			s.Group = fmt.Sprintf("u%d:%s", uid, s.Group)
+		}
+	}
 	return nil
+}
+
+// resolve finds a job by id or prefix. On a shared daemon, users only see
+// their own jobs this way (others are "not found", not "denied").
+func (d *Daemon) resolve(ref string, uid int) (*job.Job, error) {
+	if !d.opt.Paths.System || uid == 0 {
+		return d.st.Resolve(ref)
+	}
+	return d.st.ResolveFor(ref, func(j *job.Job) bool { return j.UID == uid })
+}
+
+// view is a job as uid may see it: other users' jobs show state and size only.
+func (d *Daemon) view(uid int, j *job.Job) job.Job {
+	p := j.Public()
+	if d.opt.Paths.System && uid != 0 && j.UID != uid {
+		p.Spec = job.Spec{Argv: []string{"(another user's job)"}, Kind: j.Spec.Kind, Memory: j.Spec.Memory, CPUs: j.Spec.CPUs,
+			Resources: j.Spec.Resources, Priority: j.Spec.Priority}
+		p.Note, p.Hint, p.Reasons, p.Owner, p.Result, p.Unit, p.LogsGone = "", "", nil, nil, nil, "", ""
+
+	}
+	return p
+}
+
+// logs is a job's log directory; under a system daemon, its owner is checked on every read.
+func (d *Daemon) logs(j *job.Job) logs.Dir {
+	if d.opt.Paths.System {
+		return logs.Dir{Path: d.logDir(j), Owner: j.UID}
+	}
+	return logs.Plain(d.logDir(j))
 }
 
 func keys(m map[string]int) []string {
@@ -823,11 +874,7 @@ func (d *Daemon) status(uid int, id string) api.Status {
 		if id != "" && j.ID != id {
 			continue
 		}
-		p := j.Public()
-		if d.opt.Paths.System && uid != 0 && j.UID != uid {
-			p.Spec.Argv = []string{"(another user's job)"}
-			p.Spec.Cwd, p.Spec.Name, p.Spec.Labels = "", "", nil
-		}
+		p := d.view(uid, j)
 		if j.State.Terminal() {
 			done = append(done, p)
 		} else {
@@ -878,9 +925,9 @@ func (r Retained) String() string {
 func (d *Daemon) retention(cutoff time.Time, dry bool) Retained {
 	var r Retained
 	remove := func(j *job.Job) {
-		r.Freed += logs.JobSize(d.logDir(j), j.ID)
+		r.Freed += d.logs(j).JobSize(j.ID)
 		if !dry {
-			logs.Remove(d.logDir(j), j.ID)
+			d.logs(j).Remove(j.ID)
 		}
 	}
 	finished := d.st.Finished()
@@ -897,24 +944,23 @@ func (d *Daemon) retention(cutoff time.Time, dry bool) Retained {
 		}
 		kept = append(kept, j)
 	}
-	total := d.logBytes() - r.Freed
-	for _, j := range kept {
-		if total <= int64(d.cfg.Logs.MaxTotal) {
-			break
+	// Over budget: drop the oldest finished logs of whoever uses the most, so
+	// one user's chatty jobs cannot evict everyone else's history.
+	over := d.logBytes() - r.Freed - int64(d.cfg.Logs.MaxTotal)
+	if over > 0 {
+		sizes := map[*job.Job]int64{}
+		for _, j := range kept {
+			if j.LogsGone == "" {
+				sizes[j] = d.logs(j).JobSize(j.ID)
+			}
 		}
-		if j.LogsGone != "" {
-			continue
-		}
-		size := logs.JobSize(d.logDir(j), j.ID)
-		if size == 0 {
-			continue
-		}
-		remove(j)
-		total -= size
-		r.Logs++
-		if !dry {
-			j.LogsGone = "dropped to keep all logs within logs.max_total"
-			d.save(j)
+		for _, victim := range evictions(kept, sizes, over) {
+			remove(victim)
+			r.Logs++
+			if !dry {
+				victim.LogsGone = "dropped to keep all logs within logs.max_total"
+				d.save(victim)
+			}
 		}
 	}
 	return r
@@ -932,4 +978,43 @@ func (d *Daemon) logBytes() int64 {
 		}
 	}
 	return total
+}
+
+// evictions chooses which finished jobs' logs to drop to free at least over
+// bytes: repeatedly the oldest job of the user whose logs are largest.
+// finished is oldest first.
+func evictions(finished []*job.Job, sizes map[*job.Job]int64, over int64) []*job.Job {
+	usage := map[int]int64{}
+	for j, n := range sizes {
+		usage[j.UID] += n
+	}
+	taken := map[*job.Job]bool{}
+	var out []*job.Job
+	for over > 0 {
+		heaviest, most := 0, int64(0)
+		for uid, n := range usage {
+			if n > most || (n == most && uid < heaviest) {
+				heaviest, most = uid, n
+			}
+		}
+		if most == 0 {
+			break
+		}
+		var victim *job.Job
+		for _, j := range finished {
+			if !taken[j] && sizes[j] > 0 && j.UID == heaviest {
+				victim = j
+				break
+			}
+		}
+		if victim == nil {
+			delete(usage, heaviest)
+			continue
+		}
+		taken[victim] = true
+		out = append(out, victim)
+		usage[heaviest] -= sizes[victim]
+		over -= sizes[victim]
+	}
+	return out
 }

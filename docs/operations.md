@@ -138,7 +138,28 @@ MCP are cancelled automatically when their submitter exits.
 **Maintenance window.** `berth pause` (running jobs continue, nothing new starts),
 do the work, `berth resume`.
 
-## 7. Decommission
+## 7. Shared servers (system mode)
+
+1. Install: `curl -fsSL .../install.sh | sh -s -- --system`. Users need nothing
+   else: the CLI finds `/run/berth/berth.sock` when they have no daemon of their own.
+2. Set the per-user policy in `/etc/berth/config.toml`, then `sudo berth setup --system`:
+
+   ```toml
+   [users]
+   max_share = 0.5         # one user's active jobs may hold half the pool
+   max_jobs = 100          # unfinished jobs per user
+   max_connections = 64
+   allow_services = false  # services overcommit the pool; keep them for root
+   ```
+3. Shared devices: use `--group global:NAME` (for example `global:gpu0`) for
+   resources every user must serialize on; plain group names are per user.
+4. Users see others' jobs only as state and size. Root sees everything:
+   `sudo berth status`, `sudo berth cancel ID`.
+5. Admission control (`pause`, `resume`, `prune`) is root-only.
+6. SELinux hosts: jobs get each user's login context automatically; check with
+   `berth run -- cat /proc/self/attr/current`.
+
+## 8. Decommission
 
 `berth uninstall --purge` (system: `sudo berth uninstall --system --purge`), and
 `sudo systemctl disable --now berth-maint.timer` if installed.

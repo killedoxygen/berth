@@ -14,9 +14,12 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"os/user"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -73,7 +76,48 @@ type Systemd struct {
 	system bool
 	self   string
 	pool   string
+	mu     sync.Mutex
+	ctxs   map[int]string // SELinux login context per uid
 }
+
+// contextFor is the SELinux context a system-mode job of uid runs in: the
+// configured one, else the user's own default login context from the host
+// policy (what an ssh login would get: unconfined_t, staff_t, user_t ...).
+// Jobs must not inherit the service manager's context (which, for example,
+// may not use the docker socket), and must never get more than the user's own.
+// If it cannot be determined, none is set and systemd's default applies.
+func (s *Systemd) contextFor(uid int) string {
+	if s.cfg.Backend.SELinuxContext != "" || !s.system {
+		return s.cfg.Backend.SELinuxContext
+	}
+	if data, err := os.ReadFile("/sys/fs/selinux/enforce"); err != nil || strings.TrimSpace(string(data)) != "1" {
+		return ""
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if ctx, ok := s.ctxs[uid]; ok {
+		return ctx
+	}
+	ctx := ""
+	if u, err := user.LookupId(strconv.Itoa(uid)); err == nil {
+		for _, from := range []string{"system_u:system_r:sshd_t:s0-s0:c0.c1023", "system_u:system_r:init_t:s0"} {
+			// selinuxdefcon can print the right context and still exit 1; trust a well-formed answer.
+			out, _ := run(5*time.Second, "selinuxdefcon", u.Username, from)
+			if c := strings.TrimSpace(out); contextRE.MatchString(c) {
+				ctx = c
+				break
+			}
+		}
+	}
+	if s.ctxs == nil {
+		s.ctxs = map[int]string{}
+	}
+	s.ctxs[uid] = ctx
+	return ctx
+}
+
+// contextRE accepts an SELinux context user:role:type:level (level may contain ':' and ',').
+var contextRE = regexp.MustCompile(`^[a-z0-9_]+_u:[a-z0-9_]+_r:[a-z0-9_]+_t:s[0-9]+[a-z0-9.,:\-]*$`)
 
 func UnitName(id string) string { return "berth-" + id + ".service" }
 
@@ -152,10 +196,8 @@ func (s *Systemd) Start(j *job.Job, launch string) (string, error) {
 	if j.Spec.Timeout > 0 {
 		props = append(props, "RuntimeMaxSec="+strconv.Itoa(int((j.Spec.Timeout+time.Minute).Seconds())))
 	}
-	if s.system {
-		if s.cfg.Backend.SELinuxContext != "" {
-			props = append(props, "SELinuxContext="+s.cfg.Backend.SELinuxContext)
-		}
+	if ctx := s.contextFor(j.UID); ctx != "" {
+		props = append(props, "SELinuxContext="+ctx)
 	}
 	props = append(props, s.cfg.Backend.ExtraProperties...)
 	args := s.ctl("--quiet", "--unit="+UnitName(j.ID), "--slice="+s.cfg.Backend.Slice,

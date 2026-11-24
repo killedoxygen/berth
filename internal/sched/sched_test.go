@@ -236,3 +236,46 @@ func TestHoldStopsEverything(t *testing.T) {
 		t.Fatal("a hold admits nothing")
 	}
 }
+
+func TestFairOrderInterleavesUsers(t *testing.T) {
+	w := newWorld(t)
+	a1 := w.add(job.Queued, G, 1, func(j *job.Job) { j.UID = 1001 })
+	w.add(job.Queued, G, 1, func(j *job.Job) { j.UID = 1001 })
+	w.add(job.Queued, G, 1, func(j *job.Job) { j.UID = 1001 })
+	b1 := w.add(job.Queued, G, 1, func(j *job.Job) { j.UID = 1002 })
+	q := []*job.Job{}
+	for _, j := range w.jobs {
+		q = append(q, j)
+	}
+	Order(q, true)
+	if q[0] != a1 || q[1] != b1 {
+		t.Fatal("each user's first job goes before anyone's second")
+	}
+	Order(q, false)
+	if q[1] == b1 {
+		t.Fatal("without fairness, plain age order")
+	}
+}
+
+func TestUserShareCapsOneUser(t *testing.T) {
+	w := newWorld(t)
+	w.add(job.Running, 30*G, 2, func(j *job.Job) { j.UID = 1001 })
+	more := w.add(job.Queued, 8*G, 1, func(j *job.Job) { j.UID = 1001 })
+	other := w.add(job.Queued, 8*G, 1, func(j *job.Job) { j.UID = 1002 })
+	admin := w.add(job.Queued, 8*G, 1, func(j *job.Job) { j.UID = 0 })
+	in := Input{Cfg: w.cfg, Health: w.health, Now: now, Fair: true, UserShare: 0.75, Lookup: func(id string) *job.Job { return w.jobs[id] }}
+	for _, j := range w.jobs {
+		if j.State == job.Queued {
+			in.Queued = append(in.Queued, j)
+		} else {
+			in.Active = append(in.Active, j)
+		}
+	}
+	p := Schedule(in)
+	if started(p, more) || codes(p, more) != job.RUserShare {
+		t.Fatalf("30G+8G exceeds 75%% of 46G for one user: %q", codes(p, more))
+	}
+	if !started(p, other) || !started(p, admin) {
+		t.Fatal("other users and root are not limited by that user's share")
+	}
+}

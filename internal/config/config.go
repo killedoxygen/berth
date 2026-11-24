@@ -26,7 +26,17 @@ type Config struct {
 	Services  Services  `toml:"services"`
 	Backend   Backend   `toml:"backend"`
 	Logs      Logs      `toml:"logs"`
+	Users     Users     `toml:"users"`
 	Shims     Shims     `toml:"shims"`
+}
+
+// Users limits what one user can take on a shared (system-mode) daemon.
+// They do not apply to root, nor to a per-user daemon.
+type Users struct {
+	MaxJobs        int     `toml:"max_jobs"`        // unfinished jobs per user
+	MaxShare       float64 `toml:"max_share"`       // share of pool memory one user's active jobs may hold
+	AllowServices  bool    `toml:"allow_services"`  // may users submit --service (charged by use, so it overcommits)
+	MaxConnections int     `toml:"max_connections"` // concurrent socket connections per user
 }
 
 // Logs bounds what job output may cost: each job's output is gzip-compressed
@@ -199,6 +209,7 @@ func Default(h probe.Host) Config {
 		},
 		Services: Services{FloorFraction: 0.25, Settle: units.Duration(10 * time.Minute), PeakWindow: units.Duration(time.Hour), CPUCharge: 1},
 		Backend:  Backend{Kind: kind, Slice: "berth.slice"},
+		Users:    Users{MaxJobs: 200, MaxShare: 0.75, MaxConnections: 64},
 		Logs: Logs{SegmentSize: units.Bytes(4 * units.MiB), MaxPerJob: units.Bytes(64 * units.MiB),
 			MaxTotal:  units.Bytes(clamp(homeTotal/200, 256*units.MiB, 4*units.GiB)),
 			Retention: units.Duration(30 * 24 * time.Hour), DaemonLogSize: units.Bytes(10 * units.MiB), DaemonLogKeep: 5},
@@ -244,6 +255,10 @@ func (c *Config) Validate() error {
 		return fmt.Errorf("logs.max_total must be at least logs.max_per_job")
 	case c.Logs.Retention < units.Duration(time.Minute):
 		return fmt.Errorf("logs.retention must be at least 1m")
+	case c.Users.MaxJobs < 1 || c.Users.MaxConnections < 1:
+		return fmt.Errorf("users.max_jobs and users.max_connections must be at least 1")
+	case c.Users.MaxShare <= 0 || c.Users.MaxShare > 1:
+		return fmt.Errorf("users.max_share must be in (0, 1]")
 	}
 	return nil
 }

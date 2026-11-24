@@ -119,6 +119,29 @@ func (s *Store) Resolve(ref string) (*job.Job, error) {
 	return found, nil
 }
 
+// ResolveFor is Resolve among the jobs visible to a caller.
+func (s *Store) ResolveFor(ref string, visible func(*job.Job) bool) (*job.Job, error) {
+	if j, ok := s.jobs[ref]; ok && visible(j) {
+		return j, nil
+	}
+	if len(ref) < 4 {
+		return nil, fmt.Errorf("job id %q is too short; give at least 4 characters", ref)
+	}
+	var found *job.Job
+	for id, j := range s.jobs {
+		if strings.HasPrefix(id, ref) && visible(j) {
+			if found != nil {
+				return nil, fmt.Errorf("job id %q is ambiguous", ref)
+			}
+			found = j
+		}
+	}
+	if found == nil {
+		return nil, fmt.Errorf("no job %q", ref)
+	}
+	return found, nil
+}
+
 // All returns jobs ordered by creation.
 func (s *Store) All() []*job.Job {
 	out := make([]*job.Job, 0, len(s.jobs))
