@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"syscall"
@@ -109,11 +110,27 @@ func cmdDoctor(args []string) int {
 	dir := shim.Dir(&cfg)
 	if tools := installedShims(cfg); len(tools) == 0 {
 		add("shims", "info", "no tool shims installed; heavy tools run unqueued unless called via berth run", "berth setup")
-	} else if !onPath(dir) {
-		add("shims", "warn", "shims installed ("+strings.Join(tools, " ")+") but not on this PATH",
-			`export PATH="`+dir+`:$PATH"   (setup adds this to your shell rc files and user services)`)
 	} else {
-		add("shims", "ok", "routing "+strings.Join(tools, " "), "")
+		// What matters is what this PATH resolves each tool to.
+		me, _ := filepath.EvalSymlinks(self())
+		var routed, bypassed []string
+		for _, t := range tools {
+			p, err := exec.LookPath(t)
+			if err != nil {
+				continue
+			}
+			if r, _ := filepath.EvalSymlinks(p); r == me {
+				routed = append(routed, t)
+			} else {
+				bypassed = append(bypassed, t)
+			}
+		}
+		if len(bypassed) > 0 {
+			add("shims", "warn", "on this PATH these run unrouted: "+strings.Join(bypassed, " "),
+				`export PATH="`+dir+`:$PATH"   (setup adds this to your shell rc files and user services)`)
+		} else {
+			add("shims", "ok", "routing "+strings.Join(routed, " "), "")
+		}
 	}
 
 	if st != nil {
