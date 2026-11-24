@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"syscall"
 	"testing"
@@ -378,7 +379,7 @@ func TestLogsAreCompressedAndBounded(t *testing.T) {
 	if r := berth(t, "", "wait", "--quiet", id); r.code != 0 {
 		t.Fatalf("wait: %+v", r.stderr)
 	}
-	files, _ := filepath.Glob(filepath.Join(root, "state/berth/logs", id+".*"))
+	files, _ := filepath.Glob(filepath.Join(logDir(), id+".*"))
 	var disk int64
 	for _, f := range files {
 		if !strings.HasSuffix(f, ".log.gz") {
@@ -402,6 +403,9 @@ func TestLogsAreCompressedAndBounded(t *testing.T) {
 func TestPruneRemovesFinishedJobs(t *testing.T) {
 	id := submit(t, "--", "echo", "short-lived")
 	berth(t, "", "wait", "--quiet", id)
+	if files, _ := filepath.Glob(filepath.Join(logDir(), id+".*")); len(files) == 0 {
+		t.Fatal("the job's log should exist before pruning")
+	}
 	time.Sleep(1100 * time.Millisecond)
 	if r := berth(t, "", "prune", "--dry-run", "--older-than", "1s"); !strings.Contains(r.stdout, "would prune") {
 		t.Fatalf("dry run: %+v", r)
@@ -415,7 +419,15 @@ func TestPruneRemovesFinishedJobs(t *testing.T) {
 	if r := berth(t, "", "status", "--json", id); r.code == 0 {
 		t.Fatal("a pruned job must be gone")
 	}
-	if files, _ := filepath.Glob(filepath.Join(root, "state/berth/logs", id+".*")); len(files) > 0 {
+	if files, _ := filepath.Glob(filepath.Join(logDir(), id+".*")); len(files) > 0 {
 		t.Fatalf("its logs must be gone: %v", files)
 	}
+}
+
+// logDir is where the daemon under test keeps job logs (macOS ignores XDG_STATE_HOME).
+func logDir() string {
+	if runtime.GOOS == "darwin" {
+		return filepath.Join(root, "Library", "Application Support", "berth", "logs")
+	}
+	return filepath.Join(root, "state", "berth", "logs")
 }
