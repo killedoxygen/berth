@@ -24,8 +24,33 @@ func memTotal() int64 {
 	return int64(v)
 }
 
-// memAvailable approximates Linux MemAvailable: free + inactive + speculative + purgeable pages.
+// memAvailable is what the kernel itself considers available: the percentage
+// behind memory_pressure and jetsam (it counts reclaimable file cache, which a
+// sum of vm_stat's free/inactive pages misses). vm_stat is the fallback.
 func memAvailable() int64 {
+	if level, err := unix.SysctlUint32("kern.memorystatus_level"); err == nil && level > 0 && level <= 100 {
+		return memTotal() / 100 * int64(level)
+	}
+	return vmStatAvailable()
+}
+
+// pressure maps the kernel's memory pressure level (1 normal, 2 warning, 4
+// critical) onto the PSI-like percentage the admission rules use.
+func pressure() float64 {
+	level, err := unix.SysctlUint32("kern.memorystatus_vm_pressure_level")
+	if err != nil {
+		return 0
+	}
+	switch {
+	case level >= 4:
+		return 60
+	case level >= 2:
+		return 20
+	}
+	return 0
+}
+
+func vmStatAvailable() int64 {
 	out, err := exec.Command("/usr/bin/vm_stat").Output()
 	if err != nil {
 		return 0
@@ -89,7 +114,7 @@ func GroupRSS(pgid int) int64 {
 }
 
 func Snapshot(watch []string, _ string, _ map[string]string) Health {
-	h := Health{ParentRoom: -1, JobWorking: map[string]int64{}, MemTotal: memTotal(), MemAvailable: memAvailable()}
+	h := Health{ParentRoom: -1, JobWorking: map[string]int64{}, MemTotal: memTotal(), MemAvailable: memAvailable(), PressureFull: pressure()}
 	for _, p := range watch {
 		p = ExpandPath(p)
 		if _, err := os.Stat(p); err != nil {
