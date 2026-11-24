@@ -347,3 +347,10 @@ func TestRunSurvivesDaemonOutage(t *testing.T) {
 		t.Fatalf("the job's own status must reach the caller while the daemon is down: code %d out %q err %q", code, out.String(), errb.String())
 	}
 }
+
+func TestBuildParallelismFollowsReservation(t *testing.T) {
+	r := berth(t, "", "run", "-c", "2", "--clean-env", "--env", "MAKEFLAGS=-j7", "--", "sh", "-c", `echo "$BERTH_CPUS $CARGO_BUILD_JOBS $MAKEFLAGS"`)
+	if r.stdout != "2 2 -j7\n" {
+		t.Fatalf("want sizes from the reservation, but the caller's explicit setting kept: %q", r.stdout)
+	}
+}

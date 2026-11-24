@@ -27,3 +27,35 @@ jobs:
       - name: shellcheck install.sh
         if: matrix.os == 'ubuntu-latest'
         run: shellcheck install.sh
+  onboarding:
+    # The real install path: setup (launchd on macOS; on Linux runners without a
+    # user manager, the no-service-manager fallback), a run, a background job, uninstall.
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - run: go build -o "$RUNNER_TEMP/berth" ./cmd/berth
+      - name: setup
+        run: '"$RUNNER_TEMP/berth" setup --no-path'
+      - name: use
+        run: |
+          export PATH="$HOME/.local/bin:$PATH"
+          berth doctor || true
+          set +e
+          berth run -- sh -c 'echo hello from a berth job; exit 3'
+          code=$?
+          set -e
+          test "$code" = 3
+          id=$(berth submit --name ci -- sh -c 'echo queued output')
+          test "$(berth wait "$id")" = "queued output"
+          berth status --all
+      - name: uninstall
+        run: |
+          export PATH="$HOME/.local/bin:$PATH"
+          berth uninstall --purge
+          ! berth status 2>/dev/null

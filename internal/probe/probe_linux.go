@@ -13,7 +13,7 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-const cgroupRoot = "/sys/fs/cgroup"
+var cgroupRoot = "/sys/fs/cgroup"
 
 func diskUsage(path string) (total, free int64, err error) {
 	var st unix.Statfs_t
@@ -87,7 +87,10 @@ func cgroupOf(pid string) string {
 	return ""
 }
 
-// CgroupWorking returns memory in use by a cgroup minus reclaimable clean file cache.
+// CgroupWorking returns the memory a cgroup cannot give back under its limit:
+// usage minus clean page cache (active or not; tmpfs/shmem excluded, it cannot
+// be dropped) and reclaimable slab. Counting page cache as used would make a
+// busy desktop look full and keep big jobs out for no reason.
 func CgroupWorking(rel string) (int64, bool) {
 	dir := filepath.Join(cgroupRoot, rel)
 	cur, err := readInt(filepath.Join(dir, "memory.current"))
@@ -95,14 +98,9 @@ func CgroupWorking(rel string) (int64, bool) {
 		return 0, false
 	}
 	stat := readKV(filepath.Join(dir, "memory.stat"))
-	clean := stat["inactive_file"] - stat["file_dirty"] - stat["file_writeback"]
-	if clean < 0 {
-		clean = 0
-	}
-	if clean > cur {
-		clean = cur
-	}
-	return cur - clean, true
+	clean := stat["file"] - stat["shmem"] - stat["file_dirty"] - stat["file_writeback"]
+	reclaimable := max(0, clean) + stat["slab_reclaimable"]
+	return max(0, cur-reclaimable), true
 }
 
 // CgroupOOMKills returns the oom_kill counter of a cgroup.

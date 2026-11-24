@@ -13,6 +13,8 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
@@ -35,6 +37,7 @@ type Launch struct {
 	Log         string        `json:"log"`
 	Result      string        `json:"result"`
 	PgidFile    string        `json:"pgid_file"`
+	CPUs        float64       `json:"cpus"`
 	MemoryCap   int64         `json:"memory_cap"`  // enforced here by polling only when EnforceRSS
 	EnforceRSS  bool          `json:"enforce_rss"` // no cgroup limit exists (process backend)
 	Grace       time.Duration `json:"grace"`       // SIGTERM to SIGKILL
@@ -158,7 +161,7 @@ func run(l *Launch) job.Result {
 	cmd := exec.Command(path, l.Argv[1:]...)
 	cmd.Args = l.Argv
 	cmd.Dir = l.Cwd
-	cmd.Env = append(append([]string{}, l.Env...), "BERTH_JOB_ID="+l.ID)
+	cmd.Env = jobEnv(l)
 	cmd.Stdin, cmd.Stdout, cmd.Stderr = in, out, errf
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	cgroup := probe.OwnCgroup()
@@ -262,6 +265,30 @@ loop:
 		}
 	}
 	return result
+}
+
+// jobEnv is the submitter's environment plus BERTH_JOB_ID and BERTH_CPUS, and
+// build parallelism sized to the reservation where the caller set none (so a
+// 2-CPU job does not run 24 compilers inside its quota).
+func jobEnv(l *Launch) []string {
+	env := append([]string{}, l.Env...)
+	set := map[string]bool{}
+	for _, kv := range env {
+		if k, _, ok := strings.Cut(kv, "="); ok {
+			set[k] = true
+		}
+	}
+	n := int(l.CPUs)
+	if n < 1 {
+		n = 1
+	}
+	env = append(env, "BERTH_JOB_ID="+l.ID, "BERTH_CPUS="+strconv.Itoa(n))
+	for k, v := range map[string]string{"CARGO_BUILD_JOBS": strconv.Itoa(n), "CMAKE_BUILD_PARALLEL_LEVEL": strconv.Itoa(n), "MAKEFLAGS": "-j" + strconv.Itoa(n)} {
+		if !set[k] {
+			env = append(env, k+"="+v)
+		}
+	}
+	return env
 }
 
 // lookPath resolves a bare command name against the job's PATH, not ours.

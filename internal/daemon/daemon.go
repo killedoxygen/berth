@@ -313,7 +313,7 @@ func (d *Daemon) launch(j *job.Job) {
 		ID: j.ID, Argv: j.Spec.Argv, Cwd: j.Spec.Cwd, Env: j.Spec.Env, Timeout: j.Spec.Timeout,
 		Passthrough: j.Spec.Passthrough, Token: j.Token, Socket: d.opt.Paths.Socket,
 		Log: d.st.LogPath(j.ID), Result: d.st.ResultPath(j.ID), PgidFile: backend.PgidPath(d.st.RunDir(), j.ID),
-		MemoryCap: j.Spec.Memory, EnforceRSS: !d.be.Enforces(),
+		CPUs: j.Spec.CPUs, MemoryCap: j.Spec.Memory, EnforceRSS: !d.be.Enforces(),
 	}
 	if j.Spec.UnitMemory > 0 && j.Spec.UnitMemory < l.MemoryCap {
 		l.MemoryCap = j.Spec.UnitMemory

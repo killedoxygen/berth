@@ -65,7 +65,7 @@ decision for any command line.
 $ berth status
 berth v0.1.0 · systemd-user · pool 18G of 48G charged · 10 of 22 CPUs · gpu 1/1
 fits now: --memory 11.6G --cpus 12 (default 4G / 4)
-host: 43.2G of 62.7G memory available · PSI full 8.9% · /home/day 45.8G free · btrfs unallocated 17G
+host: 43.2G of 62.7G memory available · /home/me 45.8G free · btrfs unallocated 17G
 admission: 1 waiting; next 17264918: gpu: needs 1, 0 of 1 free
 
 ID        STATE    FOR  MEM  CPU  KIND     NAME
