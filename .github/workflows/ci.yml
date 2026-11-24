@@ -31,6 +31,7 @@ jobs:
     # The real install path: setup (launchd on macOS; on Linux runners without a
     # user manager, the no-service-manager fallback), a run, a background job, uninstall.
     strategy:
+      fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
@@ -41,7 +42,7 @@ jobs:
           go-version-file: go.mod
       - run: go build -o "$RUNNER_TEMP/berth" ./cmd/berth
       - name: setup
-        run: '"$RUNNER_TEMP/berth" setup --no-path'
+        run: '"$RUNNER_TEMP/berth" setup --no-path --bin-dir "$HOME/.local/bin"'
       - name: use
         run: |
           export PATH="$HOME/.local/bin:$PATH"

@@ -576,6 +576,10 @@ func cmdUninstall(args []string) int {
 	if *purge {
 		_ = os.RemoveAll(paths.State)
 		_ = os.Remove(paths.Config)
+		_ = os.Remove(filepath.Dir(paths.Config)) // only if now empty
+		if *system {
+			_ = os.Remove(filepath.Dir(paths.Socket))
+		}
 		fmt.Println("  removed", paths.State, "and", paths.Config)
 	}
 	fmt.Println("berth uninstalled.")
