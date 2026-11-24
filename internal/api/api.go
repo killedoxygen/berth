@@ -20,19 +20,21 @@ import (
 const Version = 1
 
 type Request struct {
-	Op      string    `json:"op"`
-	ID      string    `json:"id,omitempty"`
-	Spec    *job.Spec `json:"spec,omitempty"`
-	Bind    bool      `json:"bind,omitempty"`     // cancel the job when the bound process exits
-	BindPID int       `json:"bind_pid,omitempty"` // process to bind; default: the connecting process
-	Watch   bool      `json:"watch,omitempty"`    // submit: stream events until the job ends
-	Token   string    `json:"token,omitempty"`
-	Offset  int64     `json:"offset,omitempty"`
-	Limit   int       `json:"limit,omitempty"`
-	Follow  bool      `json:"follow,omitempty"`
-	All     bool      `json:"all,omitempty"`
-	Reason  string    `json:"reason,omitempty"`
-	Update  *Update   `json:"update,omitempty"`
+	Op        string        `json:"op"`
+	ID        string        `json:"id,omitempty"`
+	Spec      *job.Spec     `json:"spec,omitempty"`
+	Bind      bool          `json:"bind,omitempty"`     // cancel the job when the bound process exits
+	BindPID   int           `json:"bind_pid,omitempty"` // process to bind; default: the connecting process
+	Watch     bool          `json:"watch,omitempty"`    // submit: stream events until the job ends
+	Token     string        `json:"token,omitempty"`
+	Offset    int64         `json:"offset,omitempty"`
+	Limit     int           `json:"limit,omitempty"`
+	Follow    bool          `json:"follow,omitempty"`
+	All       bool          `json:"all,omitempty"`
+	Reason    string        `json:"reason,omitempty"`
+	Update    *Update       `json:"update,omitempty"`
+	OlderThan time.Duration `json:"older_than,omitempty"` // prune: instead of logs.retention
+	DryRun    bool          `json:"dry_run,omitempty"`
 }
 
 type Update struct {
@@ -74,6 +76,7 @@ type Status struct {
 	Health      probe.Health `json:"health"`
 	Pool        PoolUsage    `json:"pool"`
 	Maintenance *Maintenance `json:"maintenance,omitempty"`
+	Logs        LogUsage     `json:"logs"`
 	Jobs        []job.Job    `json:"jobs"`
 }
 
@@ -89,6 +92,13 @@ type PoolUsage struct {
 	DefaultCPUs    float64        `json:"default_cpus"`
 	FitsNowMemory  int64          `json:"fits_now_memory"` // largest --memory that would start immediately
 	FitsNowCPUs    float64        `json:"fits_now_cpus"`
+}
+
+type LogUsage struct {
+	Bytes     int64         `json:"bytes"`     // on disk, compressed
+	Budget    int64         `json:"budget"`    // logs.max_total
+	PerJob    int64         `json:"per_job"`   // logs.max_per_job
+	Retention time.Duration `json:"retention"` // finished jobs expire after this
 }
 
 type Maintenance struct {

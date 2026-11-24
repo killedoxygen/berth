@@ -38,6 +38,7 @@ func init() {
 		{"cancel", "cancel jobs", cmdCancel},
 		{"update", "change a job's size, priority, kind or retries", cmdUpdate},
 		{"pause", "stop admitting new jobs (running jobs continue)", cmdPause},
+		{"prune", "apply log retention now (or --older-than D), --dry-run to preview", cmdPrune},
 		{"resume", "admit jobs again", cmdResume},
 		{"setup", "install berth for this user (or --system): config, service, shims, PATH", cmdSetup},
 		{"uninstall", "remove what setup installed", cmdUninstall},

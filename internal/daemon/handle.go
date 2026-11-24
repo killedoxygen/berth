@@ -3,7 +3,6 @@ package daemon
 import (
 	"errors"
 	"fmt"
-	"io"
 	"net"
 	"os"
 	"path/filepath"
@@ -12,6 +11,7 @@ import (
 
 	"github.com/killedoxygen/berth/internal/api"
 	"github.com/killedoxygen/berth/internal/job"
+	"github.com/killedoxygen/berth/internal/logs"
 	"github.com/killedoxygen/berth/internal/peer"
 	"github.com/killedoxygen/berth/internal/probe"
 	"github.com/killedoxygen/berth/internal/units"
@@ -139,6 +139,22 @@ func (d *Daemon) simple(cl client, req api.Request) *api.Response {
 			return resp
 		}
 		return d.update(j, req.Update)
+	case "prune":
+		if d.opt.Paths.System && cl.uid != 0 {
+			return fail(api.EDenied, "only root can prune a system daemon")
+		}
+		cutoff := time.Now().Add(-time.Duration(d.cfg.Logs.Retention))
+		if req.OlderThan > 0 {
+			cutoff = time.Now().Add(-req.OlderThan)
+		}
+		r := d.retention(cutoff, req.DryRun)
+		verb := "pruned"
+		if req.DryRun {
+			verb = "would prune"
+		} else {
+			d.log.Printf("prune by uid %d: %s", cl.uid, r)
+		}
+		return &api.Response{Data: verb + ": " + r.String()}
 	case "logs":
 		j, resp := d.lookup(cl, req.ID, false)
 		if resp != nil {
@@ -199,34 +215,17 @@ func (d *Daemon) logs(j *job.Job, offset int64, limit int) *api.Response {
 	if j.Spec.Passthrough {
 		return &api.Response{Warning: "this job's output went to its submitter's terminal, not to a log"}
 	}
-	f, err := os.Open(d.st.LogPath(j.ID))
-	if errors.Is(err, os.ErrNotExist) {
-		return &api.Response{Offset: 0}
-	}
-	if err != nil {
-		return fail(api.EInternal, "%v", err)
-	}
-	defer f.Close()
-	info, err := f.Stat()
-	if err != nil {
-		return fail(api.EInternal, "%v", err)
-	}
-	size := info.Size()
-	if offset < 0 { // tail: the last -offset bytes
-		offset = max(0, size+offset)
+	if j.LogsGone != "" {
+		return &api.Response{Warning: "this job's output is no longer stored: " + j.LogsGone}
 	}
 	if limit <= 0 || limit > maxLogChunk {
 		limit = maxLogChunk
 	}
-	if offset > size {
-		offset = size
+	data, next, err := logs.Read(d.logDir(j), j.ID, offset, limit)
+	if err != nil {
+		return fail(api.EInternal, "reading the log: %v", err)
 	}
-	buf := make([]byte, min(int64(limit), size-offset))
-	n, err := f.ReadAt(buf, offset)
-	if err != nil && !errors.Is(err, io.EOF) {
-		return fail(api.EInternal, "%v", err)
-	}
-	return &api.Response{Data: string(buf[:n]), Offset: offset + int64(n)}
+	return &api.Response{Data: data, Offset: next}
 }
 
 func (d *Daemon) submit(c *api.Conn, cl client, req api.Request, fds []int) {

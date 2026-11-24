@@ -286,18 +286,13 @@ func (s *setupCtx) service(skip bool) func() error {
 		}
 		logPath := filepath.Join(s.paths.State, "daemon.log")
 		_ = os.MkdirAll(s.paths.State, 0o700)
-		logf, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
-		if err != nil {
-			return err
-		}
-		cmd := exec.Command(s.rec.Binary, "daemon")
-		cmd.Stdout, cmd.Stderr = logf, logf
+		cmd := exec.Command(s.rec.Binary, "daemon", "--log-file", logPath)
 		cmd.SysProcAttr = detached()
 		if err := cmd.Start(); err != nil {
 			return err
 		}
 		s.rec.Service = fmt.Sprintf("pid:%d:%d", cmd.Process.Pid, probe.ProcStart(cmd.Process.Pid))
-		fmt.Printf("  add `%s daemon >>%s 2>&1 &` to your login startup to keep it across reboots\n", s.rec.Binary, logPath)
+		fmt.Printf("  add `%s daemon --log-file %s &` to your login startup to keep it across reboots\n", s.rec.Binary, logPath)
 		return nil
 	}
 }
@@ -367,15 +362,14 @@ func (s *setupCtx) launchd() error {
 <plist version="1.0">
 <dict>
   <key>Label</key><string>%s</string>
-  <key>ProgramArguments</key><array><string>%s</string><string>daemon</string></array>
+  <key>ProgramArguments</key><array><string>%s</string><string>daemon</string><string>--log-file</string><string>%s</string></array>
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><true/>
   <key>AbandonProcessGroup</key><true/>
-  <key>StandardOutPath</key><string>%s</string>
   <key>StandardErrorPath</key><string>%s</string>
 </dict>
 </plist>
-`, launchdLabel, s.rec.Binary, logPath, logPath)
+`, launchdLabel, s.rec.Binary, logPath, filepath.Join(s.paths.State, "daemon.crash.log"))
 	if err := s.write(plist, content, 0o644); err != nil {
 		return err
 	}

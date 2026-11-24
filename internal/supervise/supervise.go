@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -20,6 +21,7 @@ import (
 
 	"github.com/killedoxygen/berth/internal/api"
 	"github.com/killedoxygen/berth/internal/job"
+	"github.com/killedoxygen/berth/internal/logs"
 	"github.com/killedoxygen/berth/internal/probe"
 	"github.com/killedoxygen/berth/internal/units"
 )
@@ -34,7 +36,9 @@ type Launch struct {
 	Passthrough bool          `json:"passthrough"`
 	Token       string        `json:"token"`
 	Socket      string        `json:"socket"`
-	Log         string        `json:"log"`
+	LogDir      string        `json:"log_dir"`
+	LogSegment  int64         `json:"log_segment"`
+	LogMax      int64         `json:"log_max"`
 	Result      string        `json:"result"`
 	PgidFile    string        `json:"pgid_file"`
 	CPUs        float64       `json:"cpus"`
@@ -103,29 +107,56 @@ func ReadResult(path string) (job.Result, bool) {
 	return o.Result, true
 }
 
-func stdio(l *Launch) (in, out, errf *os.File, err error) {
+func noop() {}
+
+// stdio wires the job's descriptors. finish flushes and compresses the log; it
+// must run before the result is written.
+func stdio(l *Launch) (in, out, errf *os.File, finish func(), err error) {
 	if !l.Passthrough {
 		devnull, err := os.Open(os.DevNull)
 		if err != nil {
-			return nil, nil, nil, err
+			return nil, nil, nil, noop, err
 		}
-		log, err := os.OpenFile(l.Log, os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0o600)
+		lw, err := logs.Create(l.LogDir, l.ID, l.LogSegment, l.LogMax)
 		if err != nil {
-			return nil, nil, nil, err
+			devnull.Close()
+			return nil, nil, nil, noop, err
 		}
-		return devnull, log, log, nil
+		r, w, err := os.Pipe()
+		if err != nil {
+			devnull.Close()
+			lw.Close()
+			return nil, nil, nil, noop, err
+		}
+		done := make(chan struct{})
+		go func() {
+			_, _ = io.Copy(lw, r)
+			_ = lw.Close()
+			close(done)
+		}()
+		finish := func() {
+			_ = w.Close()
+			select {
+			case <-done:
+			case <-time.After(3 * time.Second):
+				// Something outside the job's process group still holds the pipe.
+				_ = r.Close()
+				<-done
+			}
+		}
+		return devnull, w, w, finish, nil
 	}
 	c, err := api.Dial(l.Socket)
 	if err != nil {
-		return nil, nil, nil, fmt.Errorf("claiming the submitter's terminal: %w", err)
+		return nil, nil, nil, noop, fmt.Errorf("claiming the submitter's terminal: %w", err)
 	}
 	defer c.Close()
 	if err := c.Send(api.Request{Op: "claim", ID: l.ID, Token: l.Token}); err != nil {
-		return nil, nil, nil, err
+		return nil, nil, nil, noop, err
 	}
 	var resp api.Response
 	if err := c.Recv(&resp); err != nil {
-		return nil, nil, nil, err
+		return nil, nil, nil, noop, err
 	}
 	fds := c.TakeFDs()
 	if !resp.OK || len(fds) != 3 {
@@ -133,19 +164,20 @@ func stdio(l *Launch) (in, out, errf *os.File, err error) {
 			syscall.Close(fd)
 		}
 		if resp.Error != "" {
-			return nil, nil, nil, errors.New(resp.Error)
+			return nil, nil, nil, noop, errors.New(resp.Error)
 		}
-		return nil, nil, nil, errors.New("the submitter's descriptors are no longer available")
+		return nil, nil, nil, noop, errors.New("the submitter's descriptors are no longer available")
 	}
-	return os.NewFile(uintptr(fds[0]), "stdin"), os.NewFile(uintptr(fds[1]), "stdout"), os.NewFile(uintptr(fds[2]), "stderr"), nil
+	return os.NewFile(uintptr(fds[0]), "stdin"), os.NewFile(uintptr(fds[1]), "stdout"), os.NewFile(uintptr(fds[2]), "stderr"), noop, nil
 }
 
 func run(l *Launch) job.Result {
 	signal.Ignore(syscall.SIGPIPE)
-	in, out, errf, err := stdio(l)
+	in, out, errf, finish, err := stdio(l)
 	if err != nil {
 		return job.Result{ExitCode: 125, Reason: "could not attach output: " + err.Error()}
 	}
+	defer finish()
 	if len(l.Argv) == 0 {
 		return job.Result{ExitCode: 125, Reason: "empty command"}
 	}

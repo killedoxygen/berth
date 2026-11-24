@@ -258,3 +258,19 @@ func toggle(op string, args []string) int {
 	fmt.Println("admission", map[string]string{"pause": "paused", "resume": "resumed"}[op])
 	return 0
 }
+
+func cmdPrune(args []string) int {
+	fs := newFlags("prune", "[--older-than 7d] [--dry-run]")
+	older := &durFlag{}
+	fs.Var(older, "older-than", "delete finished jobs older than this (default: logs.retention)")
+	dry := fs.Bool("dry-run", false, "report what would be removed")
+	if ok, code := parse(fs, args); !ok {
+		return code
+	}
+	resp, err := client.Call(api.Request{Op: "prune", OlderThan: older.v, DryRun: *dry})
+	if err != nil {
+		return fail(err)
+	}
+	fmt.Println(resp.Data)
+	return 0
+}

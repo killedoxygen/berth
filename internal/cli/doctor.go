@@ -142,6 +142,14 @@ func cmdDoctor(args []string) int {
 			}
 			add("disk", status, fmt.Sprintf("%s: %s free of %s (floor %s)", d.Path, units.FormatBytes(d.Free), units.FormatBytes(d.Total), units.FormatBytes(int64(cfg.Safety.MinFreeDisk))), fix)
 		}
+		if l := st.Logs; l.Budget > 0 {
+			status, fix := "ok", ""
+			if l.Bytes > l.Budget*9/10 {
+				status, fix = "warn", "berth prune --older-than 7d   (or raise logs.max_total)"
+			}
+			add("logs", status, fmt.Sprintf("%s of %s budget, compressed, finished jobs kept %s", units.FormatBytes(l.Bytes),
+				units.FormatBytes(l.Budget), units.FormatDuration(l.Retention)), fix)
+		}
 		for _, b := range h.Btrfs {
 			status, fix := "ok", ""
 			if b.Unallocated < int64(cfg.Safety.BtrfsMinUnallocated) {

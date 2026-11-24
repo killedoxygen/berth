@@ -68,6 +68,10 @@ func printOverview(st *api.Status, all bool) {
 		fmt.Println("host:", strings.Join(host, " · "))
 	}
 	fmt.Println("admission:", st.Admission)
+	if l := st.Logs; l.Budget > 0 {
+		fmt.Printf("logs: %s of %s budget (compressed; up to %s per job; finished jobs kept %s)\n",
+			b(l.Bytes), b(l.Budget), b(l.PerJob), units.FormatDuration(l.Retention))
+	}
 	if m := st.Maintenance; m != nil {
 		if m.Running {
 			fmt.Println("maintenance: running")
@@ -158,6 +162,9 @@ func printJob(j *job.Job) {
 	}
 	if j.Note != "" {
 		fmt.Printf("  note      %s\n", j.Note)
+	}
+	if j.LogsGone != "" {
+		fmt.Printf("  logs      %s\n", j.LogsGone)
 	}
 	for _, r := range j.Reasons {
 		fmt.Printf("  waits     [%s] %s\n", r.Code, r.Text)

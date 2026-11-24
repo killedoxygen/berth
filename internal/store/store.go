@@ -56,7 +56,6 @@ func (s *Store) LogDir() string { return filepath.Join(s.dir, "logs") }
 // RunDir holds supervisor result files.
 func (s *Store) RunDir() string { return filepath.Join(s.dir, "run") }
 
-func (s *Store) LogPath(id string) string    { return filepath.Join(s.LogDir(), id+".log") }
 func (s *Store) ResultPath(id string) string { return filepath.Join(s.RunDir(), id+".result") }
 func (s *Store) SpecPath(id string) string   { return filepath.Join(s.jobDir(), id+".json") }
 
@@ -143,19 +142,21 @@ func (s *Store) InStates(states ...job.State) []*job.Job {
 	return out
 }
 
-// Prune deletes the oldest finished jobs beyond keep, with their logs.
-func (s *Store) Prune(keep int) {
+// Finished returns finished jobs, oldest finish first.
+func (s *Store) Finished() []*job.Job {
 	var done []*job.Job
 	for _, j := range s.All() {
 		if j.State.Terminal() {
 			done = append(done, j)
 		}
 	}
-	for i := 0; i < len(done)-keep; i++ {
-		id := done[i].ID
-		delete(s.jobs, id)
-		_ = os.Remove(s.SpecPath(id))
-		_ = os.Remove(s.LogPath(id))
-		_ = os.Remove(s.ResultPath(id))
-	}
+	sort.SliceStable(done, func(a, b int) bool { return done[a].Finished.Before(done[b].Finished) })
+	return done
+}
+
+// Delete removes a job record and its result file (logs are the caller's).
+func (s *Store) Delete(id string) {
+	delete(s.jobs, id)
+	_ = os.Remove(s.SpecPath(id))
+	_ = os.Remove(s.ResultPath(id))
 }

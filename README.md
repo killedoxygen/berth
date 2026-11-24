@@ -119,6 +119,16 @@ machine. berth gives them:
 | Submitter | `berth run` and shim jobs are bound to their caller: if it exits, the job is cancelled (queued or running). |
 | Recovery | Jobs outlive daemon restarts; results are written by each job's supervisor and collected later. `--retries N` requeues jobs lost to a host restart or emergency stop. |
 
+## Logs and retention
+
+Background (`submit`) jobs log to compressed segments: at most 64M per job
+(the start and the end are kept, with a marker where output was dropped), all
+logs within a total budget, and finished jobs expire after 30 days.
+`berth logs ID` reads them back transparently; `berth prune --dry-run` previews
+retention. `berth run` output goes to your terminal and is not stored.
+Procedures for monitoring, upgrades, retention and incidents:
+[docs/operations.md](docs/operations.md).
+
 ## Exit status
 
 `berth run` and `berth wait` exit with the job's own status, and otherwise:
@@ -189,7 +199,9 @@ go test ./...                 # unit tests and an end-to-end suite against a rea
 go build -o berth ./cmd/berth
 ```
 
-See [docs/design.md](docs/design.md) for the architecture.
+See [docs/design.md](docs/design.md) for the architecture,
+[docs/operations.md](docs/operations.md) for operating it, and
+[SECURITY.md](SECURITY.md) for the security model and reporting.
 
 ## License
 

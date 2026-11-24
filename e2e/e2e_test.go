@@ -42,6 +42,10 @@ tick = "100ms"
 owner_grace = "1s"
 [backend]
 kind = "process"
+[logs]
+segment_size = "64K"
+max_per_job = "256K"
+max_total = "1G"
 `
 
 func TestMain(m *testing.M) {
@@ -365,5 +369,53 @@ func TestBuildParallelismFollowsReservation(t *testing.T) {
 	r := berth(t, "", "run", "-c", "2", "--clean-env", "--env", "MAKEFLAGS=-j7", "--", "sh", "-c", `echo "$BERTH_CPUS $CARGO_BUILD_JOBS $MAKEFLAGS"`)
 	if r.stdout != "2 2 -j7\n" {
 		t.Fatalf("want sizes from the reservation, but the caller's explicit setting kept: %q", r.stdout)
+	}
+}
+
+func TestLogsAreCompressedAndBounded(t *testing.T) {
+	// About 50 MiB of output into a 256K-per-job budget.
+	id := submit(t, "--", "sh", "-c", `seq 1 2000000 | sed 's/$/ of a chatty build/'`)
+	if r := berth(t, "", "wait", "--quiet", id); r.code != 0 {
+		t.Fatalf("wait: %+v", r.stderr)
+	}
+	files, _ := filepath.Glob(filepath.Join(root, "state/berth/logs", id+".*"))
+	var disk int64
+	for _, f := range files {
+		if !strings.HasSuffix(f, ".log.gz") {
+			t.Fatalf("a finished job's log must be fully compressed: %s", f)
+		}
+		info, _ := os.Stat(f)
+		disk += info.Size()
+	}
+	if disk == 0 || disk > 320<<10 {
+		t.Fatalf("log uses %d bytes on disk; budget is 256K plus one segment", disk)
+	}
+	out := berth(t, "", "logs", id).stdout
+	if !strings.HasPrefix(out, "1 of a chatty build\n") || !strings.HasSuffix(out, "2000000 of a chatty build\n") || !strings.Contains(out, "output dropped here") {
+		t.Fatalf("want head, a marker, and tail; got %d bytes", len(out))
+	}
+	if tail := berth(t, "", "logs", "--tail", "26", id).stdout; tail != "2000000 of a chatty build\n" {
+		t.Fatalf("tail: %q", tail)
+	}
+}
+
+func TestPruneRemovesFinishedJobs(t *testing.T) {
+	id := submit(t, "--", "echo", "short-lived")
+	berth(t, "", "wait", "--quiet", id)
+	time.Sleep(1100 * time.Millisecond)
+	if r := berth(t, "", "prune", "--dry-run", "--older-than", "1s"); !strings.Contains(r.stdout, "would prune") {
+		t.Fatalf("dry run: %+v", r)
+	}
+	if berth(t, "", "status", "--json", id).code != 0 {
+		t.Fatal("a dry run must not delete")
+	}
+	if r := berth(t, "", "prune", "--older-than", "1s"); r.code != 0 || !strings.Contains(r.stdout, "pruned") {
+		t.Fatalf("prune: %+v", r)
+	}
+	if r := berth(t, "", "status", "--json", id); r.code == 0 {
+		t.Fatal("a pruned job must be gone")
+	}
+	if files, _ := filepath.Glob(filepath.Join(root, "state/berth/logs", id+".*")); len(files) > 0 {
+		t.Fatalf("its logs must be gone: %v", files)
 	}
 }

@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -20,6 +21,7 @@ import (
 	"github.com/killedoxygen/berth/internal/backend"
 	"github.com/killedoxygen/berth/internal/config"
 	"github.com/killedoxygen/berth/internal/job"
+	"github.com/killedoxygen/berth/internal/logs"
 	"github.com/killedoxygen/berth/internal/maint"
 	"github.com/killedoxygen/berth/internal/probe"
 	"github.com/killedoxygen/berth/internal/sched"
@@ -67,6 +69,7 @@ type Daemon struct {
 	summary         string
 	maintenance     api.Maintenance
 	lastMaint       time.Time
+	lastRetention   time.Time
 }
 
 func New(opt Options) (*Daemon, error) {
@@ -220,6 +223,11 @@ func notifySystemd() {
 func (d *Daemon) recover() {
 	d.mu.Lock()
 	defer d.mu.Unlock()
+	for _, j := range d.st.Finished() {
+		if err := logs.Seal(d.logDir(j), j.ID); err != nil {
+			d.log.Printf("sealing the log of %s: %v", job.Short(j.ID), err)
+		}
+	}
 	for _, j := range d.st.InStates(job.Starting) {
 		if !d.be.Alive(j) {
 			if res, ok := supervise.ReadResult(d.st.ResultPath(j.ID)); ok {
@@ -278,7 +286,12 @@ func (d *Daemon) tick() {
 	}
 
 	d.mu.Lock()
-	d.st.Prune(d.cfg.Scheduler.KeepFinished)
+	if time.Since(d.lastRetention) > 10*time.Minute {
+		d.lastRetention = time.Now()
+		if r := d.retention(time.Now().Add(-time.Duration(d.cfg.Logs.Retention)), false); r.Jobs+r.Logs > 0 {
+			d.log.Printf("retention: %s", r)
+		}
+	}
 	d.mu.Unlock()
 	d.maybeMaintain()
 }
@@ -312,7 +325,8 @@ func (d *Daemon) launch(j *job.Job) {
 	l := supervise.Launch{
 		ID: j.ID, Argv: j.Spec.Argv, Cwd: j.Spec.Cwd, Env: j.Spec.Env, Timeout: j.Spec.Timeout,
 		Passthrough: j.Spec.Passthrough, Token: j.Token, Socket: d.opt.Paths.Socket,
-		Log: d.st.LogPath(j.ID), Result: d.st.ResultPath(j.ID), PgidFile: backend.PgidPath(d.st.RunDir(), j.ID),
+		LogDir: d.logDir(j), LogSegment: int64(d.cfg.Logs.SegmentSize), LogMax: int64(d.cfg.Logs.MaxPerJob),
+		Result: d.st.ResultPath(j.ID), PgidFile: backend.PgidPath(d.st.RunDir(), j.ID),
 		CPUs: j.Spec.CPUs, MemoryCap: j.Spec.Memory, EnforceRSS: !d.be.Enforces(),
 	}
 	if j.Spec.UnitMemory > 0 && j.Spec.UnitMemory < l.MemoryCap {
@@ -321,7 +335,10 @@ func (d *Daemon) launch(j *job.Job) {
 	launchPath := filepath.Join(d.st.RunDir(), j.ID+".launch")
 	err := store.WriteJSON(launchPath, l, 0o600)
 	if err == nil && d.opt.Paths.System {
-		err = d.ownFiles(j, launchPath, l.Log, l.Result)
+		err = d.ownFiles(j, launchPath)
+	}
+	if err == nil {
+		err = d.ensureLogDir(j)
 	}
 	var handle string
 	if err == nil {
@@ -331,7 +348,7 @@ func (d *Daemon) launch(j *job.Job) {
 		}
 	}
 	if err == nil {
-		handle, err = d.be.Start(j, launchPath, l.Log)
+		handle, err = d.be.Start(j, launchPath)
 	}
 	d.mu.Lock()
 	defer d.mu.Unlock()
@@ -795,6 +812,8 @@ func (d *Daemon) status(uid int, id string) api.Status {
 			FitsNowMemory: u.FitsNowMemory, FitsNowCPUs: u.FitsNowCPUs,
 		},
 	}
+	st.Logs = api.LogUsage{Bytes: d.logBytes(), Budget: int64(d.cfg.Logs.MaxTotal), PerJob: int64(d.cfg.Logs.MaxPerJob),
+		Retention: time.Duration(d.cfg.Logs.Retention)}
 	if d.maintenance.Summary != "" || d.maintenance.Running {
 		m := d.maintenance
 		st.Maintenance = &m
@@ -820,4 +839,97 @@ func (d *Daemon) status(uid int, id string) api.Status {
 	}
 	st.Jobs = append(st.Jobs, done...)
 	return st
+}
+
+// logDir is where a job's output goes. A system daemon gives each user their
+// own directory, because the job (running as that user) writes it.
+func (d *Daemon) logDir(j *job.Job) string {
+	if d.opt.Paths.System {
+		return filepath.Join(d.st.LogDir(), strconv.Itoa(j.UID))
+	}
+	return d.st.LogDir()
+}
+
+func (d *Daemon) ensureLogDir(j *job.Job) error {
+	dir := d.logDir(j)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return err
+	}
+	if d.opt.Paths.System {
+		return os.Chown(dir, j.UID, -1)
+	}
+	return nil
+}
+
+// Retained summarizes one retention pass.
+type Retained struct {
+	Jobs  int   // finished job records deleted (with their logs)
+	Logs  int   // logs deleted to stay within the total budget (records kept)
+	Freed int64 // bytes of logs removed
+}
+
+func (r Retained) String() string {
+	return fmt.Sprintf("%d finished job(s) expired, %d log(s) dropped for the budget, %s freed", r.Jobs, r.Logs, units.FormatBytes(r.Freed))
+}
+
+// retention applies the log policy: finished jobs older than cutoff go
+// entirely, records beyond keep_finished go, then the oldest finished jobs'
+// logs go until all logs fit logs.max_total. Active jobs are never touched.
+func (d *Daemon) retention(cutoff time.Time, dry bool) Retained {
+	var r Retained
+	remove := func(j *job.Job) {
+		r.Freed += logs.JobSize(d.logDir(j), j.ID)
+		if !dry {
+			logs.Remove(d.logDir(j), j.ID)
+		}
+	}
+	finished := d.st.Finished()
+	excess := len(finished) - d.cfg.Scheduler.KeepFinished
+	var kept []*job.Job
+	for i, j := range finished {
+		if j.Finished.Before(cutoff) || i < excess {
+			remove(j)
+			r.Jobs++
+			if !dry {
+				d.st.Delete(j.ID)
+			}
+			continue
+		}
+		kept = append(kept, j)
+	}
+	total := d.logBytes() - r.Freed
+	for _, j := range kept {
+		if total <= int64(d.cfg.Logs.MaxTotal) {
+			break
+		}
+		if j.LogsGone != "" {
+			continue
+		}
+		size := logs.JobSize(d.logDir(j), j.ID)
+		if size == 0 {
+			continue
+		}
+		remove(j)
+		total -= size
+		r.Logs++
+		if !dry {
+			j.LogsGone = "dropped to keep all logs within logs.max_total"
+			d.save(j)
+		}
+	}
+	return r
+}
+
+// logBytes is the disk used by all job logs.
+func (d *Daemon) logBytes() int64 {
+	total := logs.DirSize(d.st.LogDir())
+	if d.opt.Paths.System {
+		entries, _ := os.ReadDir(d.st.LogDir())
+		for _, e := range entries {
+			if e.IsDir() {
+				total += logs.DirSize(filepath.Join(d.st.LogDir(), e.Name()))
+			}
+		}
+	}
+	return total
 }

@@ -12,6 +12,7 @@ import (
 
 	"github.com/killedoxygen/berth/internal/config"
 	"github.com/killedoxygen/berth/internal/daemon"
+	"github.com/killedoxygen/berth/internal/logs"
 	"github.com/killedoxygen/berth/internal/maint"
 	"github.com/killedoxygen/berth/internal/mcp"
 	"github.com/killedoxygen/berth/internal/probe"
@@ -51,6 +52,7 @@ func clientConfig() (config.Config, config.Paths, error) {
 func cmdDaemon(args []string) int {
 	fs := newFlags("daemon", "[--system]")
 	system := fs.Bool("system", false, "system-wide daemon (root): any user may submit; jobs run as the submitter")
+	logFile := fs.String("log-file", "", "write the daemon log here, size-rotated and compressed (default: stderr, e.g. the journal)")
 	if ok, code := parse(fs, args); !ok {
 		return code
 	}
@@ -75,7 +77,16 @@ func cmdDaemon(args []string) int {
 	if *system && cfg.Backend.Kind == "process" {
 		return fail(fmt.Errorf("a system daemon needs the systemd backend"))
 	}
-	d, err := daemon.New(daemon.Options{Config: cfg, Paths: paths, Self: self(), Version: Version})
+	opt := daemon.Options{Config: cfg, Paths: paths, Self: self(), Version: Version}
+	if *logFile != "" {
+		_ = os.MkdirAll(filepath.Dir(*logFile), 0o700)
+		w, err := logs.OpenRotating(*logFile, int64(cfg.Logs.DaemonLogSize), cfg.Logs.DaemonLogKeep)
+		if err != nil {
+			return fail(err)
+		}
+		opt.Log = w
+	}
+	d, err := daemon.New(opt)
 	if err != nil {
 		return fail(err)
 	}

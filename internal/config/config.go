@@ -25,7 +25,20 @@ type Config struct {
 	Scheduler Scheduler `toml:"scheduler"`
 	Services  Services  `toml:"services"`
 	Backend   Backend   `toml:"backend"`
+	Logs      Logs      `toml:"logs"`
 	Shims     Shims     `toml:"shims"`
+}
+
+// Logs bounds what job output may cost: each job's output is gzip-compressed
+// in segments and capped (head and tail kept), finished jobs expire, and all
+// logs together stay within a budget (oldest finished jobs' logs go first).
+type Logs struct {
+	SegmentSize   units.Bytes    `toml:"segment_size"`    // compressed once full
+	MaxPerJob     units.Bytes    `toml:"max_per_job"`     // compressed bytes kept per job
+	MaxTotal      units.Bytes    `toml:"max_total"`       // all job logs together
+	Retention     units.Duration `toml:"retention"`       // finished jobs and their logs are deleted after this
+	DaemonLogSize units.Bytes    `toml:"daemon_log_size"` // daemon log rotation, when not under journald
+	DaemonLogKeep int            `toml:"daemon_log_keep"`
 }
 
 type Pool struct {
@@ -59,7 +72,7 @@ type Scheduler struct {
 	Aging        units.Duration `toml:"aging"`         // a job blocked this long stops being overtaken by long jobs
 	ShortJob     units.Duration `toml:"short_job"`     // jobs with a timeout at most this may still overtake it
 	OwnerGrace   units.Duration `toml:"owner_grace"`   // time a bound job survives its submitter (reattach window)
-	KeepFinished int            `toml:"keep_finished"` // finished job records kept
+	KeepFinished int            `toml:"keep_finished"` // finished job records kept at most (see also logs.retention)
 }
 
 type Services struct {
@@ -182,10 +195,13 @@ func Default(h probe.Host) Config {
 		},
 		Scheduler: Scheduler{
 			Tick: units.Duration(time.Second), Aging: units.Duration(10 * time.Minute),
-			ShortJob: units.Duration(30 * time.Minute), OwnerGrace: units.Duration(10 * time.Second), KeepFinished: 500,
+			ShortJob: units.Duration(30 * time.Minute), OwnerGrace: units.Duration(10 * time.Second), KeepFinished: 2000,
 		},
 		Services: Services{FloorFraction: 0.25, Settle: units.Duration(10 * time.Minute), PeakWindow: units.Duration(time.Hour), CPUCharge: 1},
 		Backend:  Backend{Kind: kind, Slice: "berth.slice"},
+		Logs: Logs{SegmentSize: units.Bytes(4 * units.MiB), MaxPerJob: units.Bytes(64 * units.MiB),
+			MaxTotal:  units.Bytes(clamp(homeTotal/200, 256*units.MiB, 4*units.GiB)),
+			Retention: units.Duration(30 * 24 * time.Hour), DaemonLogSize: units.Bytes(10 * units.MiB), DaemonLogKeep: 5},
 		Shims: Shims{
 			Tools: []string{"cargo", "make", "gmake", "ninja", "cmake", "go", "docker", "podman", "git"},
 			Git: GitRoute{LargeIndex: units.Bytes(32 * units.MiB), Memory: units.Bytes(4 * units.GiB), CPUs: 2,
@@ -222,6 +238,12 @@ func (c *Config) Validate() error {
 		return fmt.Errorf("backend.kind must be auto, systemd or process")
 	case c.Services.FloorFraction < 0 || c.Services.FloorFraction > 1:
 		return fmt.Errorf("services.floor_fraction must be between 0 and 1")
+	case c.Logs.SegmentSize < units.Bytes(4*units.KiB) || c.Logs.MaxPerJob < c.Logs.SegmentSize:
+		return fmt.Errorf("logs.segment_size must be at least 4K and logs.max_per_job at least one segment")
+	case c.Logs.MaxTotal < c.Logs.MaxPerJob:
+		return fmt.Errorf("logs.max_total must be at least logs.max_per_job")
+	case c.Logs.Retention < units.Duration(time.Minute):
+		return fmt.Errorf("logs.retention must be at least 1m")
 	}
 	return nil
 }

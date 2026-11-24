@@ -123,6 +123,7 @@ type Job struct {
 	Token     string    `json:"token,omitempty"` // secret the supervisor presents to claim passthrough descriptors
 	Unit      string    `json:"unit,omitempty"`  // backend handle: systemd unit name or "pid:start"
 	PeakBytes int64     `json:"peak_bytes,omitempty"`
+	LogsGone  string    `json:"logs_gone,omitempty"` // why the output is no longer stored (retention, budget)
 }
 
 func NewID() string { return randHex(16) }

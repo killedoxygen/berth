@@ -28,7 +28,7 @@ import (
 type Backend interface {
 	Name() string
 	// Start launches the supervisor for a job; launch is the supervisor's launch file.
-	Start(j *job.Job, launch, logPath string) (handle string, err error)
+	Start(j *job.Job, launch string) (handle string, err error)
 	// Alive reports whether the job's supervisor still runs.
 	Alive(j *job.Job) bool
 	// Stop asks the supervisor to stop the job (it escalates to SIGKILL itself).
@@ -121,7 +121,7 @@ func (s *Systemd) JobCgroup(j *job.Job) string    { return s.pool + "/" + UnitNa
 func (s *Systemd) Working(*job.Job) (int64, bool) { return 0, false }
 func (s *Systemd) Enforces() bool                 { return true }
 
-func (s *Systemd) Start(j *job.Job, launch, logPath string) (string, error) {
+func (s *Systemd) Start(j *job.Job, launch string) (string, error) {
 	cap := j.Spec.Memory
 	if j.Spec.UnitMemory > 0 && j.Spec.UnitMemory < cap {
 		cap = j.Spec.UnitMemory
@@ -144,8 +144,10 @@ func (s *Systemd) Start(j *job.Job, launch, logPath string) (string, error) {
 		"KillMode=mixed",
 		"TimeoutStopSec=30",
 		"CollectMode=inactive-or-failed",
-		"StandardOutput=append:" + logPath,
-		"StandardError=append:" + logPath,
+		// Job output goes to berth's compressed logs; only the supervisor's own
+		// diagnostics reach the journal.
+		"StandardOutput=journal",
+		"StandardError=journal",
 	}
 	if j.Spec.Timeout > 0 {
 		props = append(props, "RuntimeMaxSec="+strconv.Itoa(int((j.Spec.Timeout+time.Minute).Seconds())))
@@ -213,19 +215,15 @@ func (p *Process) PoolCgroup() string        { return "" }
 func (p *Process) JobCgroup(*job.Job) string { return "" }
 func (p *Process) Enforces() bool            { return false }
 
-func (p *Process) Start(j *job.Job, launch, logPath string) (string, error) {
-	logf, err := os.OpenFile(logPath, os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0o600)
-	if err != nil {
-		return "", err
-	}
-	defer logf.Close()
+func (p *Process) Start(j *job.Job, launch string) (string, error) {
 	devnull, err := os.Open(os.DevNull)
 	if err != nil {
 		return "", err
 	}
 	defer devnull.Close()
 	cmd := exec.Command(p.self, "__supervise", launch)
-	cmd.Stdin, cmd.Stdout, cmd.Stderr = devnull, logf, logf
+	// The supervisor's own diagnostics go to the daemon's log.
+	cmd.Stdin, cmd.Stdout, cmd.Stderr = devnull, os.Stderr, os.Stderr
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
 	if err := cmd.Start(); err != nil {
 		return "", err
