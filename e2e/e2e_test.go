@@ -321,6 +321,19 @@ func TestMCP(t *testing.T) {
 	if len(lines) != 3 {
 		t.Fatalf("want 3 responses (notification gets none), got %d: %s", len(lines), r.stdout)
 	}
+	// Some hosts show only structuredContent, so it must carry the output and exit code too.
+	var resp struct {
+		Result struct {
+			StructuredContent struct {
+				ExitCode int    `json:"exit_code"`
+				Output   string `json:"output"`
+			} `json:"structuredContent"`
+		} `json:"result"`
+	}
+	json.Unmarshal([]byte(lines[2]), &resp)
+	if sc := resp.Result.StructuredContent; sc.ExitCode != 3 || sc.Output != "from-mcp\n" {
+		t.Fatalf("structured result incomplete: %+v", sc)
+	}
 	if !strings.Contains(lines[1], `"berth_run"`) || !strings.Contains(lines[2], "exit code 3") || !strings.Contains(lines[2], "from-mcp") {
 		t.Fatalf("unexpected: %s", r.stdout)
 	}

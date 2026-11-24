@@ -305,44 +305,65 @@ func reusedNote(r *api.Response) string {
 	return ""
 }
 
+// Outcome is the structured result of berth_run and berth_wait. Hosts may show
+// it instead of the text, so it carries everything, output included.
+type Outcome struct {
+	ID        string  `json:"id"`
+	State     string  `json:"state"`
+	ExitCode  *int    `json:"exit_code,omitempty"`
+	Seconds   float64 `json:"seconds,omitempty"`
+	Note      string  `json:"note,omitempty"`
+	WaitedFor string  `json:"waited_for,omitempty"`
+	Waiting   string  `json:"waiting,omitempty"` // why it has not started yet
+	Output    string  `json:"output,omitempty"`  // last 16K of output
+	Next      string  `json:"next,omitempty"`
+}
+
 func finish(id string, wait time.Duration) (string, any, error) {
-	var waitedFor []string
+	var waitedFor string
 	j, err := client.Watch(id, wait, func(r *api.Response) {
 		if r.Event == "queued" && r.Job != nil && len(r.Job.Reasons) > 0 {
-			waitedFor = append(waitedFor, client.Explain(r.Job))
+			waitedFor = client.Explain(r.Job)
 		}
 	})
 	if j == nil {
 		return "", nil, err
 	}
+	o := Outcome{ID: j.ID, State: string(j.State), Note: j.Note, WaitedFor: waitedFor}
 	var b strings.Builder
 	if !j.State.Terminal() {
 		fmt.Fprintf(&b, "job %s is still %s after %s", j.ID, j.State, units.FormatDuration(wait))
 		if j.State == job.Queued {
-			fmt.Fprintf(&b, ": %s", client.Explain(j))
+			o.Waiting = client.Explain(j)
+			fmt.Fprintf(&b, ": %s", o.Waiting)
 		}
+		o.Next = "call berth_wait with this id, or berth_cancel"
 		b.WriteString(". Call berth_wait again, or berth_cancel.\n")
-		return b.String(), j, nil
-	}
-	dur := ""
-	if !j.Started.IsZero() {
-		dur = " in " + units.FormatDuration(j.Finished.Sub(j.Started))
-	}
-	fmt.Fprintf(&b, "job %s %s, exit code %d%s", job.Short(j.ID), j.State, client.ExitCode(j), dur)
-	if j.Note != "" {
-		fmt.Fprintf(&b, " (%s)", j.Note)
-	}
-	b.WriteString("\n")
-	if len(waitedFor) > 0 {
-		fmt.Fprintf(&b, "waited for: %s\n", waitedFor[len(waitedFor)-1])
+	} else {
+		code := client.ExitCode(j)
+		o.ExitCode = &code
+		dur := ""
+		if !j.Started.IsZero() {
+			o.Seconds = j.Finished.Sub(j.Started).Seconds()
+			dur = " in " + units.FormatDuration(j.Finished.Sub(j.Started))
+		}
+		fmt.Fprintf(&b, "job %s %s, exit code %d%s", job.Short(j.ID), j.State, code, dur)
+		if j.Note != "" {
+			fmt.Fprintf(&b, " (%s)", j.Note)
+		}
+		b.WriteString("\n")
+		if waitedFor != "" {
+			fmt.Fprintf(&b, "waited for: %s\n", waitedFor)
+		}
 	}
 	if !j.Started.IsZero() {
 		if tail, err := client.Tail(j.ID, 16<<10); err == nil && tail != "" {
+			o.Output = tail
 			b.WriteString("--- output (last 16K) ---\n")
 			b.WriteString(tail)
 		}
 	}
-	return b.String(), j, nil
+	return b.String(), o, nil
 }
 
 func statusText(s *api.Status) string {
